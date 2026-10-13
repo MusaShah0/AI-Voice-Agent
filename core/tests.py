@@ -1,8 +1,9 @@
 import base64
 import json
-import wave
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import numpy as np
 
 from channels.db import database_sync_to_async
 from channels.routing import URLRouter
@@ -26,16 +27,11 @@ class FakeVADService:
 class FakeSTTService:
 	last_audio_parameters = None
 
-	def __init__(self, model_size):
+	def __init__(self, model_size, language):
 		pass
 
-	def transcribe(self, audio_file_path):
-		with wave.open(audio_file_path, "rb") as audio_file:
-			type(self).last_audio_parameters = (
-				audio_file.getnchannels(),
-				audio_file.getsampwidth(),
-				audio_file.getframerate(),
-			)
+	def transcribe(self, audio_data):
+		type(self).last_audio_parameters = (audio_data.dtype, len(audio_data))
 		return "test transcription"
 
 
@@ -88,7 +84,7 @@ class VoiceConsumerTests(TransactionTestCase):
 		self.fake_tts = FakeTTSService()
 		self.patches = [
 			patch("core.consumers.VADService", return_value=self.fake_vad),
-			patch("core.consumers.STTService", return_value=FakeSTTService("base")),
+			patch("core.consumers.STTService", return_value=FakeSTTService("base.en", "en")),
 			patch("core.consumers.LLMService", return_value=FakeLLMService()),
 			patch("core.consumers.TTSService", return_value=self.fake_tts),
 		]
@@ -163,13 +159,13 @@ class VoiceConsumerTests(TransactionTestCase):
 		finally:
 			await self.communicator.disconnect()
 
-	async def test_binary_pcm_is_wrapped_as_wav_before_transcription(self):
+	async def test_binary_pcm_is_converted_to_float32_for_transcription(self):
 		await self.connect_communicator()
 		try:
 			# Speech chunk (16,000 bytes = 0.5s speech)
 			speech_chunk = b"\x01\x00" * 8000
-			# Silence chunk (24,000 bytes = 0.75s silence, triggers SILENCE_THRESHOLD_BYTES)
-			silence_chunk = b"\x00\x00" * 12000
+			# Silence chunk (16,000 bytes = 0.5s silence, exactly the endpoint threshold)
+			silence_chunk = b"\x00\x00" * 8000
 			await self.communicator.send_to(bytes_data=speech_chunk)
 			await self.communicator.send_to(bytes_data=silence_chunk)
 
@@ -185,7 +181,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(processing["type"], "processing")
 			self.assertEqual(response["user_transcription"], "test transcription")
 			self.assertTrue(stream_messages)
-			self.assertEqual(FakeSTTService.last_audio_parameters, (1, 2, 16000))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 16000))
 		finally:
 			await self.communicator.disconnect()
 
@@ -276,14 +272,24 @@ from core.models import Doctor, Appointment, Task
 class VoiceOptimizationTests(TransactionTestCase):
 	def test_transcription_uses_beam_size_one(self):
 		service = STTService.__new__(STTService)
+		service.language = "en"
 		service.model = MagicMock()
 		service.model.transcribe.return_value = ([MagicMock(text="test transcript")], None)
 
-		result = service.transcribe(bytes(320))
+		audio_data = np.zeros(160, dtype=np.float32)
+		result = service.transcribe(audio_data)
 
 		self.assertEqual(result, "test transcript")
 		service.model.transcribe.assert_called_once()
-		self.assertEqual(service.model.transcribe.call_args.kwargs["beam_size"], 1)
+		self.assertEqual(
+			service.model.transcribe.call_args.kwargs,
+			{
+				"beam_size": 1,
+				"vad_filter": False,
+				"condition_on_previous_text": False,
+				"language": "en",
+			},
+		)
 
 	def test_vad_trusts_silero_hub_repository(self):
 		with patch(
@@ -405,6 +411,10 @@ class LLMServiceToolsTests(TransactionTestCase):
 		))
 		self.assertTrue(llm.client.chat.completions.create.call_args.kwargs["stream"])
 		self.assertEqual(
+			llm.client.chat.completions.create.call_args.kwargs["max_completion_tokens"],
+			280,
+		)
+		self.assertEqual(
 			llm.client.chat.completions.create.call_args.kwargs["reasoning_effort"],
 			"low",
 		)
@@ -441,6 +451,16 @@ class LLMServiceToolsTests(TransactionTestCase):
 			end_time="2026-10-15T14:30:00Z",
 		)
 		second_request_messages = llm.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+		first_request = llm.client.chat.completions.create.call_args_list[0].kwargs
+		self.assertEqual(first_request["max_completion_tokens"], 280)
+		self.assertEqual(first_request["tool_choice"], "auto")
+		self.assertEqual(
+			[
+				tool["function"]["name"]
+				for tool in first_request["tools"]
+			],
+			["check_doctor_availability", "book_appointment"],
+		)
 		self.assertEqual(second_request_messages[-1]["role"], "tool")
 		self.assertEqual(second_request_messages[-1]["tool_call_id"], "call-123")
 		self.assertEqual(json.loads(second_request_messages[-1]["content"]), {"available": True})

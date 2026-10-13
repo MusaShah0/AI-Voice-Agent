@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Optional
+
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
@@ -9,9 +10,14 @@ _stt_singletons = {}
 
 
 class STTService:
-    def __init__(self, model_size="base"):
-        logger.info("Initializing Faster-Whisper (%s) on CPU...", model_size)
+    def __init__(self, model_size="base.en", language="en"):
+        logger.info(
+            "Initializing Faster-Whisper (%s) on CPU language=%s...",
+            model_size,
+            language,
+        )
         self.model_size = model_size
+        self.language = language
         self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     def transcribe(self, audio_input) -> str:
@@ -44,7 +50,13 @@ class STTService:
             return ""
 
         try:
-            segments, _ = self.model.transcribe(audio_data, beam_size=1)
+            segments, _ = self.model.transcribe(
+                audio_data,
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                language=self.language,
+            )
             transcript = " ".join([segment.text for segment in segments])
             return transcript.strip()
         except Exception as e:
@@ -52,8 +64,12 @@ class STTService:
             return ""
 
 
-def get_stt_service(model_size: str = "base") -> STTService:
+def get_stt_service(model_size: str = "base.en", language: str = "en") -> STTService:
     global _stt_singletons
-    if model_size not in _stt_singletons:
-        _stt_singletons[model_size] = STTService(model_size=model_size)
-    return _stt_singletons[model_size]
+    singleton_key = (model_size, language)
+    if singleton_key not in _stt_singletons:
+        _stt_singletons[singleton_key] = STTService(
+            model_size=model_size,
+            language=language,
+        )
+    return _stt_singletons[singleton_key]

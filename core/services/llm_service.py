@@ -351,7 +351,7 @@ class LLMService:
                         messages=messages,
                         tools=self.TOOL_DEFINITIONS,
                         tool_choice="auto",
-                        max_completion_tokens=300,
+                        max_completion_tokens=280,
                         reasoning_effort="low",
                         stream=True,
                     )

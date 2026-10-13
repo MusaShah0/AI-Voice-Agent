@@ -23,11 +23,11 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │ 1. VAD Layer (Silero VAD on CPU)                             │
  │    • 512-sample (32ms) sliding evaluation                     │
  │    • 300ms pre-speech buffer                                  │
- │    • 700ms silence endpoint threshold                         │
+ │    • 500ms silence endpoint threshold                         │
  │    • User barge-in / interruption cancellation                │
  │                                                               │
- │ 2. STT Layer (Faster-Whisper "base" INT8 on CPU)              │
- │    • In-memory temporary WAV repackaging                      │
+ │ 2. STT Layer (Faster-Whisper "base.en" INT8 on CPU)           │
+ │    • Direct 16kHz PCM-to-float32 NumPy input                  │
  │    • Transcribes user speech utterance to text                │
  │                                                               │
  │ 3. Dialog & Tool Layer (Groq: openai/gpt-oss-20b)             │
@@ -60,8 +60,8 @@ The system coordinates a real-time conversational voice loop connecting a React 
    - If silence precedes speech, a rolling 300ms pre-speech ring buffer retains starting consonants.
    - Once speech is detected, audio accumulates into `audio_buffer`.
    - If the user speaks while the agent is playing an earlier response, the active turn task is immediately cancelled, and `{"status": "audio_stopped"}` is dispatched to cut off frontend audio playback.
-3. **Endpointing**: When `consecutive_silence_bytes` reaches 700ms (`SILENCE_THRESHOLD_BYTES = 22,400 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
-4. **Transcription (STT)**: The accumulated PCM bytes are wrapped in a 16kHz mono WAV header and transcribed using `Faster-Whisper` (`compute_type="int8"` on CPU).
+3. **Endpointing**: When `consecutive_silence_bytes` reaches 500ms (`SILENCE_THRESHOLD_BYTES = 16,000 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
+4. **Transcription (STT)**: The accumulated 16kHz mono PCM bytes are converted directly to a normalized float32 NumPy array and passed to `Faster-Whisper` (`compute_type="int8"`, `beam_size=1`, `vad_filter=False`, `condition_on_previous_text=False`, and English language hint by default). No temporary WAV file is written.
 5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.stream_dialog()`. Groq streams the final answer; any requested scheduling tools are executed before its spoken confirmation:
    - Queries `check_doctor_availability(start_time, end_time)` to inspect Google Calendar freebusy and SQLite DB.
    - If a conflict exists, it informs the caller and suggests alternative slots.
@@ -249,8 +249,8 @@ class Transcript(models.Model):
 | `AUDIO_SAMPLE_RATE` | `16000` | Input audio sample frequency in Hz. |
 | `AUDIO_SAMPLE_WIDTH` | `2` | 16-bit audio = 2 bytes per sample. |
 | `BYTES_PER_MS` | `32` | 1 millisecond = (16000 * 2) / 1000 = 32 bytes. |
-| `SILENCE_THRESHOLD_MS` | `700` | Sustained silence duration required to trigger end of utterance. |
-| `SILENCE_THRESHOLD_BYTES`| `22400` | 700 ms * 32 bytes/ms. |
+| `SILENCE_THRESHOLD_MS` | `500` | Sustained silence duration required to trigger end of utterance. |
+| `SILENCE_THRESHOLD_BYTES`| `16000` | 500 ms * 32 bytes/ms. |
 | `PRE_SPEECH_BUFFER_BYTES`| `9600` | 300 ms lead-in ring buffer to prevent clipping starting consonants. |
 | `MIN_SPEECH_BYTES` | `8000` | 250 ms minimum audio required to reject mic pops/coughs. |
 | `MAX_SPEECH_BYTES` | `800000` | 25 seconds safety ceiling to force processing in noisy environments. |
@@ -264,7 +264,7 @@ class Transcript(models.Model):
 - `_reset_speech_state(self)`: Clears `audio_buffer`, `pre_speech_buffer`, resets `speech_detected = False` and `consecutive_silence_bytes = 0`.
 - `_start_task(self, coroutine)`: Dispatches `coroutine` as an `asyncio.Task` with collision guard (`_send_busy()` if a task is already executing).
 - `_run_safely(self, coroutine)`: Wraps coroutine execution to catch `asyncio.CancelledError` and log unhandled exceptions.
-- `process_audio_pipeline(self, audio_data: bytes)`: Writes raw PCM bytes into a temporary in-memory WAV file with 16kHz mono header, calls `stt.transcribe()`, unlinks the temporary file, and triggers `run_dialog_and_respond()`.
+- `process_audio_pipeline(self, audio_data: bytes)`: Converts PCM-16 input directly to normalized float32 NumPy samples, calls `stt.transcribe()`, and triggers `run_dialog_and_respond()`.
 - `run_dialog_and_respond(self, user_text: str)`: Executes `llm.process_dialog()`, calls `tts.synthesize()`, encodes audio as base64, persists turn to `Transcript` in the DB, and dispatches `agent_response` over WebSocket.
 
 ---
@@ -282,14 +282,16 @@ class Transcript(models.Model):
 ---
 
 ### `core/services/stt_service.py`
-**Responsibility**: Speech-to-Text transcription on CPU using `faster-whisper`.
+**Responsibility**: English Speech-to-Text transcription on CPU using `faster-whisper`.
 
-- `STTService.__init__(self, model_size="base")`: Loads Faster-Whisper model on CPU using `compute_type="int8"` for real-time CPU transcription.
+- `STTService.__init__(self, model_size="base.en", language="en")`: Loads Faster-Whisper on CPU using `compute_type="int8"`. The consumer accepts `STT_MODEL` and `STT_LANGUAGE` environment overrides.
 - `transcribe(self, audio_input) -> str`:
-  - **Input**: Path to WAV file, raw PCM-16 bytes, or numpy float32 array.
-  - **Processing**: Reads WAV file, resamples to 16kHz if necessary, and calls `model.transcribe(beam_size=1)` for faster CPU inference.
+  - **Input**: Float32 NumPy audio array (used by the live consumer), WAV file path, raw PCM-16 bytes, or numpy float32 array.
+  - **Processing**: Calls `model.transcribe(beam_size=1, vad_filter=False, condition_on_previous_text=False, language="en")` by default. Local VAD has already detected speech, so Whisper's VAD filter is disabled.
   - **Output**: Joined text transcription string.
-- `get_stt_service(model_size="base") -> STTService`: Module-level singleton cache keyed by model size.
+- `get_stt_service(model_size="base.en", language="en") -> STTService`: Module-level singleton cache keyed by model and language.
+
+The English-only `base.en` model was compared locally with multilingual `base` on the supplied sample: mean transcription times were approximately 0.89 s vs. 0.91 s, and normalized transcripts were 98.7% similar. This single-sample measurement is not a general accuracy or latency guarantee. STT stays local by default; no audio is sent to Groq.
 
 ---
 
@@ -416,8 +418,8 @@ Open **`http://localhost:3000`** in Google Chrome or Microsoft Edge.
 
 - [x] **Microphone Capture**: Captures 1-channel audio, converts float32 to 16kHz PCM-16.
 - [x] **WebSocket Transport**: Binary PCM audio streams cleanly to `ws://127.0.0.1:8001/ws/voice/`.
-- [x] **VAD Endpointing**: 512-sample evaluation on CPU with 700ms silence detection.
-- [x] **Faster-Whisper STT**: Transcribes voice to text in ~1-2 seconds on CPU.
+- [x] **VAD Endpointing**: 512-sample evaluation on CPU with 500ms silence detection.
+- [x] **Faster-Whisper STT**: Transcribes local English voice input directly from float32 PCM arrays with `base.en` and CPU INT8 inference.
 - [x] **LLM Tool Calling**: Groq's configured model executes free/busy checks and appointment bookings.
 - [x] **Database Persistence**: Appointments, tasks, and dialogue transcripts persist to SQLite.
 - [x] **Streaming Speech Playback**: Groq sentence output is synthesized by local Piper, relayed as PCM chunks, and queued with Web Audio.

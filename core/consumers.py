@@ -5,10 +5,11 @@ import json
 import logging
 import os
 import re
-import tempfile
 import threading
 import time
-import wave
+
+import numpy as np
+
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from .repositories import DataRepository
@@ -24,8 +25,8 @@ AUDIO_SAMPLE_WIDTH = 2
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
-SILENCE_THRESHOLD_MS = 700
-SILENCE_THRESHOLD_BYTES = SILENCE_THRESHOLD_MS * BYTES_PER_MS  # ~22,400 bytes (~700ms silence)
+SILENCE_THRESHOLD_MS = 500
+SILENCE_THRESHOLD_BYTES = SILENCE_THRESHOLD_MS * BYTES_PER_MS  # 16,000 bytes (500ms silence)
 PRE_SPEECH_BUFFER_BYTES = 300 * BYTES_PER_MS                    # ~9,600 bytes (~300ms lead-in)
 MIN_SPEECH_BYTES = 250 * BYTES_PER_MS                           # ~8,000 bytes (~250ms min utterance)
 MAX_SPEECH_BYTES = 25 * AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH  # ~800,000 bytes (~25s max safety ceiling)
@@ -40,10 +41,10 @@ def _resolve_vad():
     return get_vad_service()
 
 
-def _resolve_stt(model_size="base"):
+def _resolve_stt(model_size="base.en", language="en"):
     if hasattr(STTService, 'return_value'):
-        return STTService(model_size)
-    return get_stt_service(model_size)
+        return STTService(model_size, language)
+    return get_stt_service(model_size, language)
 
 
 def _resolve_tts():
@@ -73,7 +74,11 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         try:
             self.vad, self.stt, self.tts = await asyncio.gather(
                 asyncio.to_thread(_resolve_vad),
-                asyncio.to_thread(_resolve_stt, "base"),
+                asyncio.to_thread(
+                    _resolve_stt,
+                    os.environ.get("STT_MODEL", "base.en"),
+                    os.environ.get("STT_LANGUAGE", "en"),
+                ),
                 asyncio.to_thread(_resolve_tts),
             )
             logger.info(
@@ -355,31 +360,20 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             logger.warning("Pipeline STT skipped: empty audio session=%s", self.session_id)
             return
 
-        logger.info(
-            "Pipeline STT: preparing audio session=%s audio_bytes=%s duration_ms=%.0f",
-            self.session_id,
-            len(audio_data),
-            len(audio_data) / BYTES_PER_MS,
-        )
         audio_preparation_started = time.perf_counter()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio_file:
-            temp_audio_path = temp_audio_file.name
-
         try:
-            with wave.open(temp_audio_path, "wb") as audio_file:
-                audio_file.setnchannels(1)
-                audio_file.setsampwidth(AUDIO_SAMPLE_WIDTH)
-                audio_file.setframerate(AUDIO_SAMPLE_RATE)
-                audio_file.writeframes(audio_data)
+            audio_samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             logger.info(
-                "Pipeline STT: audio prepared session=%s elapsed_ms=%.2f",
+                "Pipeline STT: PCM converted to float32 session=%s samples=%s duration_ms=%.0f elapsed_ms=%.2f",
                 self.session_id,
+                len(audio_samples),
+                len(audio_data) / BYTES_PER_MS,
                 (time.perf_counter() - audio_preparation_started) * 1000,
             )
 
             stt_started = time.perf_counter()
             logger.info("Pipeline STT: transcription started session=%s", self.session_id)
-            user_text = await asyncio.to_thread(self.stt.transcribe, temp_audio_path)
+            user_text = await asyncio.to_thread(self.stt.transcribe, audio_samples)
             logger.info(
                 "Pipeline STT: transcription completed session=%s characters=%s elapsed_ms=%.2f",
                 self.session_id,
@@ -389,10 +383,6 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         except Exception:
             logger.exception("Pipeline STT failed session=%s", self.session_id)
             user_text = ""
-        finally:
-            if os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
-                logger.debug("Pipeline STT: removed temporary WAV session=%s", self.session_id)
 
         if user_text.strip():
             await self.run_dialog_and_respond(user_text)

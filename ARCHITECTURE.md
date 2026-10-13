@@ -39,7 +39,7 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │        - book_appointment()                                   │
  │                                                               │
  │ 4. Scheduling & Persistence Layer                             │
- │    • Google Calendar API v3 (Free/Busy & Event creation)      │
+ │    • Google Calendar API v3 (event creation)                  │
  │    • SQLite Database via Django ORM (Doctor, Appointment,     │
  │      Task, Transcript)                                        │
  │                                                               │
@@ -55,15 +55,17 @@ The system coordinates a real-time conversational voice loop connecting a React 
 ```
 
 ### Detailed Sequence of a Voice Turn
-1. **Audio Capture**: The browser's `AudioContext` captures raw mic audio via `ScriptProcessorNode` (buffer size 4096), resamples float32 data down to 16,000 Hz 16-bit signed Linear PCM, and streams binary byte chunks over the WebSocket.
+0. **Connection Welcome**: After voice services initialize, the backend sends Janus’s welcome caption and synthesizes it with Piper. The browser displays the introduction and queues its PCM audio before handling user turns.
+1. **Audio Capture**: The browser requests a 16kHz `AudioContext` so browser-managed resampling is used when supported. At 16kHz it uses 512-sample frames, converts float32 samples directly to 16-bit signed PCM, and streams binary frames over WebSocket. If the requested context rate is unavailable, it falls back to the default context and existing client-side conversion. Browser noise suppression is disabled for the current accuracy comparison; echo cancellation and automatic gain control remain enabled.
 2. **Speech Detection (VAD)**: In `VoiceConsumer`, each chunk is evaluated by `Silero VAD`.
+   - Per-connection buffering retains partial chunks until a complete 512-sample (1024-byte) window is available, avoiding discarded remainders without mixing audio between WebSocket sessions.
    - If silence precedes speech, a rolling 300ms pre-speech ring buffer retains starting consonants.
    - Once speech is detected, audio accumulates into `audio_buffer`.
    - If the user speaks while the agent is playing an earlier response, the active turn task is immediately cancelled, and `{"status": "audio_stopped"}` is dispatched to cut off frontend audio playback.
 3. **Endpointing**: When `consecutive_silence_bytes` reaches 500ms (`SILENCE_THRESHOLD_BYTES = 16,000 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
 4. **Transcription (STT)**: The accumulated 16kHz mono PCM bytes are converted directly to a normalized float32 NumPy array and passed to `Faster-Whisper` (`compute_type="int8"`, `beam_size=1`, `vad_filter=False`, `condition_on_previous_text=False`, and English language hint by default). No temporary WAV file is written.
 5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.stream_dialog()`. Groq streams the final answer; any requested scheduling tools are executed before its spoken confirmation:
-   - Queries `check_doctor_availability(start_time, end_time)` to inspect Google Calendar freebusy and SQLite DB.
+   - Queries `check_doctor_availability(start_time, end_time)` against SQLite only; appointment writes are synced to Google Calendar when booking.
    - If a conflict exists, it informs the caller and suggests alternative slots.
    - Once the user confirms, it executes `book_appointment(caller_name, start_time, end_time, purpose)`.
 6. **Speech Synthesis (TTS)**: As streamed text reaches sentence boundaries, `VoiceConsumer` synthesizes each sentence locally with Piper on a worker thread. A bounded queue lets Groq continue generating while Piper synthesizes the previous sentence.
@@ -191,10 +193,10 @@ class Doctor(models.Model):
     SINGLETON_ID = 1
     name = models.CharField(max_length=255)
     email = models.EmailField(unique=True)
-    timezone = models.CharField(max_length=50, default='UTC')
+    timezone = models.CharField(max_length=50, default='Asia/Karachi')
 ```
 - **Constraints**: Database-level check constraint `doctor_singleton_id` guarantees `id == 1`.
-- **Default Record**: ID 1, `name="Dr. Melvin"`, `email="musa813705@gmail.com"`, `timezone="UTC"`.
+- **Default Record**: ID 1, `name="Dr. Melvin"`, `email="musa813705@gmail.com"`, `timezone="Asia/Karachi"`.
 
 ### 2. `Appointment` Model
 Stores scheduled clinic appointments.
@@ -209,7 +211,7 @@ class Appointment(models.Model):
 ```
 - `doctor`: ForeignKey to `Doctor` (ID 1).
 - `caller_name`: Patient or caller full name.
-- `start_time` / `end_time`: Timezone-aware UTC timestamps for the appointment window.
+- `start_time` / `end_time`: Timezone-aware timestamps representing the clinic-local appointment window; Django stores instants in UTC.
 - `purpose`: Reason for visit or symptoms described by patient.
 - `status`: Default `"Scheduled"`. Can be `"Cancelled"`, `"Completed"`.
 
@@ -301,14 +303,14 @@ The English-only `base.en` model was compared locally with multilingual `base` o
 - **Model**: Reads `GROQ_MODEL` from `.env`, defaulting to `openai/gpt-oss-20b`.
 - `__init__(self, calendar_service=None)`: Initializes the Groq client with `GROQ_API_KEY`.
 - `_get_system_instruction(self) -> str`: Dynamically embeds current date and time (`Monday, October 12, 2026 at...`) and instructs Janus on tool calling, concise voice responses, and medical receptionist persona.
-- `_parse_datetime(self, dt_str: str) -> datetime.datetime`: Robust parser supporting ISO formats and multiple datetime string patterns (`%Y-%m-%d %H:%M:%S`, etc.), guaranteeing UTC timezone-awareness.
+- `_parse_datetime(self, dt_str: str) -> datetime.datetime`: Parses ISO and common datetime strings; naive values are clinic-local (`Asia/Karachi`), while offset-aware values are converted to the clinic timezone.
 - `check_doctor_availability(self, start_time: str, end_time: str) -> Dict[str, Any]`:
-  - Queries Google Calendar `freebusy` (if authenticated).
-  - Queries local database for conflicting `Appointment` records where `start_time < slot_end AND end_time > slot_start`.
+  - Queries SQLite only for conflicting `Appointment` records where `start_time < slot_end AND end_time > slot_start`; does not call Google Calendar.
+  - Formats conflicts and available times in the clinic timezone.
   - Returns `{"available": bool, "conflicts": list, "message": str}`.
   - Updates `self.last_tool_status` to `"availability_checked"` or `"conflict_detected"`.
 - `book_appointment(self, caller_name: str, start_time: str, end_time: str, purpose: str) -> Dict[str, Any]`:
-  - Inserts event to Google Calendar if authenticated.
+  - Inserts event to Google Calendar if authenticated, using an explicit clinic-local UTC offset.
   - Calls `DataRepository.create_appointment_sync()` to persist appointment to SQLite.
   - Calls `DataRepository.create_task_sync()` to create doctor chart review task.
   - Updates `self.last_tool_status` to `"calendar_booked"`.
@@ -334,7 +336,7 @@ The English-only `base.en` model was compared locally with multilingual `base` o
 - `__init__(self, credentials_file=None, token_file=None, base_dir=None)`: Discovers `client_secret_*.json` in root directory and defaults token storage to `token.json`.
 - `is_authenticated(self) -> bool`: Checks if valid, unexpired credentials exist in `token.json`. Gracefully degrades to local DB scheduling if false.
 - `authenticate_interactive(self, port=0) -> bool`: Launches interactive OAuth consent flow in browser and saves `token.json`. Can be run directly via CLI.
-- `check_availability(self, start_time, end_time, calendar_id='primary') -> Dict[str, Any]`: Runs `service.freebusy().query()` and returns detailed conflict event summaries if busy.
+- `check_availability(self, start_time, end_time, calendar_id='primary') -> Dict[str, Any]`: Optional direct FreeBusy helper; the appointment availability tool does not call it and checks SQLite only.
 - `create_event(self, summary, start_time, end_time, description="", calendar_id='primary', caller_name=None) -> Dict[str, Any]`: Inserts confirmed event via `service.events().insert()`.
 
 ---
@@ -380,7 +382,7 @@ pip install -r requirements.txt
 .\venv\Scripts\python.exe manage.py migrate
 
 # Verify the Doctor singleton record (ID 1: Dr. Melvin) is seeded
-.\venv\Scripts\python.exe -c "import django, os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'voice_agent_project.settings'); django.setup(); from core.models import Doctor; doc, _ = Doctor.objects.get_or_create(id=Doctor.SINGLETON_ID, defaults={'name': 'Dr. Melvin', 'email': 'musa813705@gmail.com', 'timezone': 'UTC'}); print(f'Doctor seeded: {doc.name} (ID: {doc.id})')"
+.\venv\Scripts\python.exe -c "import django, os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'voice_agent_project.settings'); django.setup(); from core.models import Doctor; doc, _ = Doctor.objects.get_or_create(id=Doctor.SINGLETON_ID, defaults={'name': 'Dr. Melvin', 'email': 'musa813705@gmail.com', 'timezone': 'Asia/Karachi'}); print(f'Doctor seeded: {doc.name} (ID: {doc.id})')"
 ```
 
 ### 3. Optional: Google Calendar Interactive OAuth

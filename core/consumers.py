@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_SAMPLE_WIDTH = 2
+VAD_WINDOW_BYTES = 512 * AUDIO_SAMPLE_WIDTH
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
@@ -31,6 +32,10 @@ PRE_SPEECH_BUFFER_BYTES = 300 * BYTES_PER_MS                    # ~9,600 bytes (
 MIN_SPEECH_BYTES = 250 * BYTES_PER_MS                           # ~8,000 bytes (~250ms min utterance)
 MAX_SPEECH_BYTES = 25 * AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH  # ~800,000 bytes (~25s max safety ceiling)
 AUDIO_CHUNK_BYTES = 8192
+WELCOME_TEXT = (
+    "Hello, I’m Janus, Dr. Melvin’s appointment scheduler. "
+    "I can help you check availability or schedule a visit. How may I help you today?"
+)
 SENTENCE_BOUNDARY = re.compile(r'[.!?](?:["\')\]]*)\s+')
 SENTENCE_ABBREVIATIONS = {"dr.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "etc."}
 
@@ -68,6 +73,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None
         self.speech_vad_elapsed_seconds = 0.0
+        self.vad_remainder = bytearray()
 
         initialization_started = time.perf_counter()
         logger.info("Pipeline connect: initializing voice services session=%s", self.session_id)
@@ -97,7 +103,53 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             await self.close(code=4000)
             return
 
+        try:
+            await self._send_welcome()
+        except Exception:
+            logger.exception("Pipeline welcome failed session=%s", self.session_id)
+            await self.send(text_data=json.dumps({
+                "type": "error",
+                "message": "Janus connected, but the welcome audio could not be prepared.",
+            }))
+
         logger.info("Pipeline ready: WebSocket connected session=%s", self.session_id)
+
+    async def _send_welcome(self):
+        self.turn_counter = 1
+        await self.send(text_data=json.dumps({
+            "type": "welcome",
+            "turn_id": self.turn_counter,
+            "caption": WELCOME_TEXT,
+        }))
+
+        audio_bytes, sample_rate = await asyncio.to_thread(
+            self.tts.synthesize,
+            WELCOME_TEXT,
+        )
+        if not audio_bytes:
+            raise RuntimeError("Piper returned no audio for the welcome message")
+        if len(audio_bytes) % AUDIO_SAMPLE_WIDTH:
+            raise ValueError("Piper welcome PCM output is not aligned to 16-bit samples")
+
+        for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
+            audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
+            await self.send(text_data=json.dumps({
+                "type": "audio_chunk",
+                "turn_id": self.turn_counter,
+                "sequence": sequence,
+                "format": "pcm_s16le",
+                "channels": 1,
+                "sample_rate": sample_rate,
+                "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
+            }))
+
+        await self.send(text_data=json.dumps({
+            "type": "agent_response",
+            "turn_id": self.turn_counter,
+            "is_welcome": True,
+            "caption": WELCOME_TEXT,
+            "tool_status": None,
+        }))
 
     async def disconnect(self, close_code):
         if self.active_task and not self.active_task.done():
@@ -116,14 +168,26 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 return
             clean_chunk = bytes_data[:aligned_len]
 
+            self.vad_remainder.extend(clean_chunk)
+            vad_aligned_len = (
+                len(self.vad_remainder)
+                - (len(self.vad_remainder) % VAD_WINDOW_BYTES)
+            )
+            vad_audio = bytes(self.vad_remainder[:vad_aligned_len])
+            del self.vad_remainder[:vad_aligned_len]
+
             vad_started_at = time.perf_counter()
             try:
-                has_speech = await asyncio.to_thread(self.vad.is_speech, clean_chunk)
+                has_speech = (
+                    await asyncio.to_thread(self.vad.is_speech, vad_audio)
+                    if vad_audio
+                    else False
+                )
             except Exception:
                 logger.exception(
                     "Pipeline VAD failed session=%s chunk_bytes=%s",
                     self.session_id,
-                    len(clean_chunk),
+                    len(vad_audio),
                 )
                 raise
             vad_elapsed = time.perf_counter() - vad_started_at

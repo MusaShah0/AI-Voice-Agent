@@ -17,10 +17,12 @@ from .routing import websocket_urlpatterns
 class FakeVADService:
 	def __init__(self):
 		self.call_count = 0
+		self.audio_lengths = []
 
 	def is_speech(self, audio_chunk):
 		# First call returns True (speech start), subsequent calls return False (silence endpoint)
 		self.call_count += 1
+		self.audio_lengths.append(len(audio_chunk))
 		return self.call_count == 1
 
 
@@ -84,6 +86,7 @@ class VoiceConsumerTests(TransactionTestCase):
 		self.fake_tts = FakeTTSService()
 		self.patches = [
 			patch("core.consumers.VADService", return_value=self.fake_vad),
+			patch("core.consumers.get_vad_service", return_value=self.fake_vad),
 			patch("core.consumers.STTService", return_value=FakeSTTService("base.en", "en")),
 			patch("core.consumers.LLMService", return_value=FakeLLMService()),
 			patch("core.consumers.TTSService", return_value=self.fake_tts),
@@ -99,6 +102,26 @@ class VoiceConsumerTests(TransactionTestCase):
 		)
 		connected, _ = await self.communicator.connect()
 		self.assertTrue(connected)
+		welcome = await self.communicator.receive_json_from(timeout=3)
+		self.assertEqual(welcome["type"], "welcome")
+		self.assertEqual(welcome["caption"], (
+			"Hello, I’m Janus, Dr. Melvin’s appointment scheduler. "
+			"I can help you check availability or schedule a visit. How may I help you today?"
+		))
+		welcome_audio = []
+		while True:
+			message = await self.communicator.receive_json_from(timeout=3)
+			if message["type"] == "agent_response":
+				self.assertTrue(message["is_welcome"])
+				self.assertEqual(message["turn_id"], 1)
+				break
+			welcome_audio.append(message)
+		self.assertTrue(welcome_audio)
+		self.assertTrue(all(message["type"] == "audio_chunk" for message in welcome_audio))
+		self.assertEqual(
+			b"".join(base64.b64decode(message["audio_payload"]) for message in welcome_audio),
+			b"test audio",
+		)
 
 	async def test_text_turn_returns_audio_and_saves_transcript(self):
 		await self.connect_communicator()
@@ -138,16 +161,21 @@ class VoiceConsumerTests(TransactionTestCase):
 
 			self.assertEqual(response["type"], "agent_response")
 			self.assertEqual(response["caption"], "Dr. Melvin is available. Would you like to book?")
-			self.assertEqual(response["turn_id"], 1)
+			self.assertEqual(response["turn_id"], 2)
 			self.assertEqual(
 				self.fake_tts.inputs,
-				["Dr. Melvin is available.", "Would you like to book?"],
+				[
+					"Hello, I’m Janus, Dr. Melvin’s appointment scheduler. "
+					"I can help you check availability or schedule a visit. How may I help you today?",
+					"Dr. Melvin is available.",
+					"Would you like to book?",
+				],
 			)
 			self.assertTrue(stream_messages)
 			self.assertTrue(all(message["type"] == "audio_chunk" for message in stream_messages))
 			self.assertEqual(
 				b"".join(base64.b64decode(message["audio_payload"]) for message in stream_messages),
-				b"test audio" * len(self.fake_tts.inputs),
+				b"test audio" * (len(self.fake_tts.inputs) - 1),
 			)
 			transcript = await database_sync_to_async(
 				lambda: Transcript.objects.get(session_id__startswith="session_")
@@ -182,6 +210,40 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(response["user_transcription"], "test transcription")
 			self.assertTrue(stream_messages)
 			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 16000))
+		finally:
+			await self.communicator.disconnect()
+
+	async def test_vad_preserves_partial_windows_between_audio_frames(self):
+		await self.connect_communicator()
+		try:
+			await self.communicator.send_to(bytes_data=b"\x01\x00" * 256)
+			await self.communicator.send_to(text_data="not-json")
+			self.assertEqual(
+				(await self.communicator.receive_json_from(timeout=3))["type"],
+				"error",
+			)
+			self.assertEqual(self.fake_vad.call_count, 0)
+
+			await self.communicator.send_to(bytes_data=b"\x01\x00" * 256)
+			await self.communicator.send_to(text_data="not-json")
+			self.assertEqual(
+				(await self.communicator.receive_json_from(timeout=3))["type"],
+				"error",
+			)
+			self.assertEqual(self.fake_vad.call_count, 1)
+			self.assertEqual(self.fake_vad.audio_lengths, [1024])
+
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 8000)
+			processing = await self.communicator.receive_json_from(timeout=3)
+			while True:
+				message = await self.communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					break
+
+			self.assertEqual(processing["type"], "processing")
+			self.assertEqual(self.fake_vad.call_count, 2)
+			self.assertTrue(all(length % 1024 == 0 for length in self.fake_vad.audio_lengths))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 8512))
 		finally:
 			await self.communicator.disconnect()
 
@@ -334,34 +396,51 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertIn("Dr. Melvin's clinic schedule", instruction)
 		self.assertIn("Never claim that the appointment was added to the caller's personal calendar", instruction)
 
-	def test_check_doctor_availability_without_calendar(self):
+	def test_check_doctor_availability_uses_database_only_and_clinic_timezone(self):
 		mock_cal = MagicMock()
-		mock_cal.is_authenticated.return_value = False
 		llm = LLMService(calendar_service=mock_cal)
 
-		# Free slot
-		res = llm.check_doctor_availability("2026-10-15 14:00:00", "2026-10-15 14:30:00")
+		res = llm.check_doctor_availability(
+			"2026-10-15 14:00:00",
+			"2026-10-15 14:30:00",
+		)
 		self.assertTrue(res["available"])
 		self.assertEqual(res["conflicts"], [])
+		self.assertIn("02:00 PM and 02:30 PM", res["message"])
+		mock_cal.is_authenticated.assert_not_called()
+		mock_cal.check_availability.assert_not_called()
+
+		# Naive tool datetimes are clinic-local; offset datetimes are converted to clinic-local.
+		local_dt = llm._parse_datetime("2026-10-15 14:00:00")
+		offset_dt = llm._parse_datetime("2026-10-15T09:00:00Z")
+		self.assertEqual(local_dt.isoformat(), "2026-10-15T14:00:00+05:00")
+		self.assertEqual(offset_dt.isoformat(), "2026-10-15T14:00:00+05:00")
 
 		# Book an existing appointment in DB
 		Appointment.objects.create(
 			doctor=self.doctor,
 			caller_name="Existing Patient",
-			start_time="2026-10-15 14:00:00+00:00",
-			end_time="2026-10-15 14:30:00+00:00",
+			start_time=local_dt,
+			end_time=llm._parse_datetime("2026-10-15 14:30:00"),
 			purpose="Checkup",
 			status="Scheduled"
 		)
 
 		# Conflicting slot
-		res2 = llm.check_doctor_availability("2026-10-15 14:00:00", "2026-10-15 14:30:00")
+		res2 = llm.check_doctor_availability(
+			"2026-10-15 14:00:00",
+			"2026-10-15 14:30:00",
+		)
 		self.assertFalse(res2["available"])
 		self.assertEqual(llm.last_tool_status, "conflict_detected")
+		self.assertIn("02:00 PM to 02:30 PM", res2["message"])
+		mock_cal.is_authenticated.assert_not_called()
+		mock_cal.check_availability.assert_not_called()
 
 	def test_book_appointment_persists_to_db_and_creates_task(self):
 		mock_cal = MagicMock()
-		mock_cal.is_authenticated.return_value = False
+		mock_cal.is_authenticated.return_value = True
+		mock_cal.create_event.return_value = {"id": "google-event-123"}
 		llm = LLMService(calendar_service=mock_cal)
 
 		result = llm.book_appointment(
@@ -374,11 +453,16 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertEqual(result["status"], "confirmed")
 		self.assertEqual(result["caller_name"], "John Doe")
 		self.assertEqual(llm.last_tool_status, "calendar_booked")
+		self.assertTrue(result["google_calendar_synced"])
+		calendar_start = mock_cal.create_event.call_args.kwargs["start_time"]
+		self.assertEqual(calendar_start.isoformat(), "2026-10-16T10:00:00+05:00")
 
 		# Verify DB records
 		app = Appointment.objects.get(id=result["appointment_id"])
 		self.assertEqual(app.caller_name, "John Doe")
 		self.assertEqual(app.purpose, "General Consultation")
+		self.assertEqual(app.start_time, llm._parse_datetime("2026-10-16 10:00:00"))
+		self.assertEqual(result["start_time"], "Friday, October 16 at 10:00 AM")
 
 		# Verify task created
 		task = Task.objects.get(appointment=app)

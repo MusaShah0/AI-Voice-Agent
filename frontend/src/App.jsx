@@ -42,6 +42,15 @@ function pcm16FromFloat(input, inputSampleRate) {
   return output.buffer
 }
 
+function pcm16AtTargetRateFromFloat(input) {
+  const output = new Int16Array(input.length)
+  for (let index = 0; index < input.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, input[index]))
+    output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+  }
+  return output.buffer
+}
+
 function App() {
   const socketUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname || 'localhost'}:8001/ws/voice/`
   const [connectionState, setConnectionState] = useState('disconnected')
@@ -85,6 +94,24 @@ function App() {
     setIsPlaying(false)
   }
 
+  const unlockPlaybackAudio = () => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextClass) return
+
+    try {
+      if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+        playbackContextRef.current = new AudioContextClass()
+      }
+      if (playbackContextRef.current.state === 'suspended') {
+        playbackContextRef.current.resume().catch(() => {
+          setError('Audio playback could not be enabled. Check your browser audio permissions.')
+        })
+      }
+    } catch {
+      setError('Audio playback could not be enabled. Check your browser audio permissions.')
+    }
+  }
+
   const finishPlaybackIfReady = () => {
     if (playbackCompleteRef.current && playbackSourcesRef.current.size === 0) {
       if (playbackContextRef.current && playbackContextRef.current.state !== 'closed') {
@@ -109,7 +136,7 @@ function App() {
       throw new Error('Received an invalid audio sample rate.')
     }
     if (playbackTurnRef.current !== message.turn_id) {
-      stopPlayback()
+      if (playbackTurnRef.current !== null) stopPlayback()
       playbackTurnRef.current = message.turn_id
     }
     if (message.sequence !== playbackSequenceRef.current) {
@@ -173,11 +200,13 @@ function App() {
     }
 
     if (message.type === 'agent_response') {
-      setTurns((current) => current.concat({
-        user: message.user_transcription,
-        agent: message.caption,
-        toolStatus: message.tool_status,
-      }))
+      if (!message.is_welcome) {
+        setTurns((current) => current.concat({
+          user: message.user_transcription,
+          agent: message.caption,
+          toolStatus: message.tool_status,
+        }))
+      }
       setPending(false)
       setError('')
       playbackQueueRef.current = playbackQueueRef.current.then(() => {
@@ -187,6 +216,11 @@ function App() {
           finishPlaybackIfReady()
         }
       })
+    } else if (message.type === 'welcome') {
+      setTurns((current) => current.concat({
+        isWelcome: true,
+        agent: message.caption,
+      }))
     } else if (message.type === 'audio_chunk') {
       latestAudioTurnRef.current = message.turn_id
       playbackQueueRef.current = playbackQueueRef.current
@@ -218,6 +252,8 @@ function App() {
       return Promise.resolve(socketRef.current)
     }
     if (socketPromiseRef.current) return socketPromiseRef.current
+
+    unlockPlaybackAudio()
 
     let parsedUrl
     try {
@@ -309,7 +345,7 @@ function App() {
       audio: {
         channelCount: 1,
         echoCancellation: true,
-        noiseSuppression: true,
+        noiseSuppression: false,
         autoGainControl: true,
       },
     }).then((stream) => {
@@ -322,18 +358,27 @@ function App() {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext
       if (!AudioContextClass) throw new Error('This browser does not support Web Audio.')
 
-      const context = new AudioContextClass()
+      let context
+      try {
+        context = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE })
+      } catch {
+        context = new AudioContextClass()
+      }
       contextRef.current = context
       await context.resume()
       const source = context.createMediaStreamSource(stream)
-      const processor = context.createScriptProcessor(4096, 1, 1)
+      const processorBufferSize = context.sampleRate === TARGET_SAMPLE_RATE ? 512 : 4096
+      const processor = context.createScriptProcessor(processorBufferSize, 1, 1)
       sourceRef.current = source
       processorRef.current = processor
       recordingRef.current = true
       processor.onaudioprocess = (audioEvent) => {
         const input = audioEvent.inputBuffer.getChannelData(0)
         if (socket.readyState === WebSocket.OPEN && recordingRef.current) {
-          socket.send(pcm16FromFloat(input, context.sampleRate))
+          const pcm = context.sampleRate === TARGET_SAMPLE_RATE
+            ? pcm16AtTargetRateFromFloat(input)
+            : pcm16FromFloat(input, context.sampleRate)
+          socket.send(pcm)
         }
         audioEvent.outputBuffer.getChannelData(0).fill(0)
       }
@@ -531,11 +576,15 @@ function App() {
                 <article className="turn" key={`${index}-${turn.user}`}>
                   <div className="turn-number">{String(index + 1).padStart(2, '0')}</div>
                   <div className="turn-content">
-                    <div className="speaker-label user-label"><span /> YOU</div>
-                    <p>{turn.user}</p>
-                    <div className="speaker-label agent-label"><span /> DR. MELVIN’S OFFICE</div>
+                    {!turn.isWelcome && (
+                      <>
+                        <div className="speaker-label user-label"><span /> YOU</div>
+                        <p>{turn.user}</p>
+                      </>
+                    )}
+                    <div className="speaker-label agent-label"><span /> {turn.isWelcome ? 'JANUS' : 'DR. MELVIN’S OFFICE'}</div>
                     <p>{turn.agent}</p>
-                    {turn.toolStatus && (
+                    {!turn.isWelcome && turn.toolStatus && (
                       <div className={`tool-status ${turn.toolStatus}`}>
                         {toolStatusLabels[turn.toolStatus] || 'Appointment details updated'}
                       </div>

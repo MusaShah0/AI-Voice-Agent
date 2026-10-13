@@ -7,7 +7,7 @@ class Doctor(models.Model):
 
     name = models.CharField(max_length=255)
     email = models.EmailField(unique=True)
-    timezone = models.CharField(max_length=50, default='UTC')
+    timezone = models.CharField(max_length=50, default='Asia/Karachi')
 
     class Meta:
         constraints = [

@@ -5,7 +5,10 @@ import os
 import time
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
+from django.conf import settings
+from django.utils import timezone as django_timezone
 from groq import Groq
 
 from core.models import Doctor, Appointment
@@ -13,6 +16,7 @@ from core.repositories import DataRepository
 from core.services.calendar_service import GoogleCalendarService, CalendarAuthError
 
 logger = logging.getLogger(__name__)
+CLINIC_TIMEZONE = ZoneInfo(settings.TIME_ZONE)
 
 
 def _log_tool_timing(tool_name):
@@ -53,11 +57,11 @@ class LLMService:
                     "properties": {
                         "start_time": {
                             "type": "string",
-                            "description": "Appointment start datetime in ISO 8601 format.",
+                            "description": "Appointment start datetime in the clinic's local timezone (Asia/Karachi, UTC+05:00), ISO 8601 format including +05:00 offset.",
                         },
                         "end_time": {
                             "type": "string",
-                            "description": "Appointment end datetime in ISO 8601 format.",
+                            "description": "Appointment end datetime in the clinic's local timezone (Asia/Karachi, UTC+05:00), ISO 8601 format including +05:00 offset.",
                         },
                     },
                     "required": ["start_time", "end_time"],
@@ -79,11 +83,11 @@ class LLMService:
                         },
                         "start_time": {
                             "type": "string",
-                            "description": "Confirmed appointment start datetime in ISO 8601 format.",
+                            "description": "Confirmed appointment start datetime in the clinic's local timezone (Asia/Karachi, UTC+05:00), ISO 8601 format including +05:00 offset.",
                         },
                         "end_time": {
                             "type": "string",
-                            "description": "Confirmed appointment end datetime in ISO 8601 format.",
+                            "description": "Confirmed appointment end datetime in the clinic's local timezone (Asia/Karachi, UTC+05:00), ISO 8601 format including +05:00 offset.",
                         },
                         "purpose": {
                             "type": "string",
@@ -112,11 +116,14 @@ class LLMService:
         self.last_tool_status = None
 
     def _get_system_instruction(self) -> str:
-        now_dt = datetime.datetime.now()
+        now_dt = django_timezone.localtime(django_timezone.now(), CLINIC_TIMEZONE)
         now_str = now_dt.strftime("%A, %B %d, %Y at %I:%M %p")
         return (
             "You are Janus, an AI front-desk medical receptionist for Dr. Melvin's clinic. "
             f"The current date and time is {now_str}. "
+            "Interpret all caller dates and times in the clinic's local timezone, Asia/Karachi (UTC+05:00). "
+            "Pass appointment times to scheduling tools with an explicit +05:00 offset, and speak all times "
+            "back to the caller in that same clinic-local timezone. Never reinterpret a clinic-local time as UTC. "
             "Your duties:\n"
             "1. Help callers check Dr. Melvin's availability and book appointments.\n"
             "2. When the caller asks about a specific date or time, call check_doctor_availability.\n"
@@ -151,9 +158,9 @@ class LLMService:
             else:
                 dt = datetime.datetime.now() + datetime.timedelta(days=1)
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt
+        if django_timezone.is_naive(dt):
+            dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
+        return dt.astimezone(CLINIC_TIMEZONE)
 
     @_log_tool_timing("check_doctor_availability")
     def check_doctor_availability(self, start_time: str, end_time: str) -> Dict[str, Any]:
@@ -175,43 +182,41 @@ class LLMService:
                 "message": "I could not determine the exact date and time. Please ask the caller to clarify."
             }
 
-        # 1. Check Google Calendar if authenticated
+        # SQLite is the source of truth for appointment conflicts; Google is only used when booking.
         try:
-            if self.calendar_service.is_authenticated():
-                result = self.calendar_service.check_availability(start_dt, end_dt)
-                if not result.get("available"):
-                    self.last_tool_status = "conflict_detected"
-                    return {
-                        "available": False,
-                        "conflicts": result.get("conflicts", []),
-                        "message": "Doctor has an existing event on Google Calendar during this time."
-                    }
-        except Exception as cal_err:
-            logger.warning("Google Calendar availability query failed: %s", cal_err)
-
-        # 2. Check Local Database for conflicts
-        try:
-            conflicting_apps = Appointment.objects.filter(
+            conflict = Appointment.objects.filter(
                 status="Scheduled",
                 start_time__lt=end_dt,
                 end_time__gt=start_dt
-            )
-            if conflicting_apps.exists():
-                conflict = conflicting_apps.first()
+            ).first()
+            if conflict:
                 self.last_tool_status = "conflict_detected"
                 return {
                     "available": False,
                     "conflicts": [{"summary": f"Appointment: {conflict.purpose}"}],
-                    "message": f"Dr. Melvin is busy with an existing appointment from {conflict.start_time.strftime('%I:%M %p')} to {conflict.end_time.strftime('%I:%M %p')}."
+                    "message": (
+                        "Dr. Melvin is busy with an existing appointment from "
+                        f"{django_timezone.localtime(conflict.start_time, CLINIC_TIMEZONE).strftime('%I:%M %p')} "
+                        f"to {django_timezone.localtime(conflict.end_time, CLINIC_TIMEZONE).strftime('%I:%M %p')}."
+                    )
                 }
         except Exception as db_err:
-            logger.error("Database conflict check failed: %s", db_err)
+            logger.exception("Database conflict check failed: %s", db_err)
+            self.last_tool_status = "error"
+            return {
+                "available": False,
+                "conflicts": [],
+                "message": "Availability could not be verified due to a database error.",
+            }
 
         self.last_tool_status = "availability_checked"
         return {
             "available": True,
             "conflicts": [],
-            "message": f"Dr. Melvin is completely free between {start_dt.strftime('%I:%M %p')} and {end_dt.strftime('%I:%M %p')}."
+            "message": (
+                "Dr. Melvin is completely free between "
+                f"{start_dt.strftime('%I:%M %p')} and {end_dt.strftime('%I:%M %p')}."
+            )
         }
 
     @_log_tool_timing("book_appointment")

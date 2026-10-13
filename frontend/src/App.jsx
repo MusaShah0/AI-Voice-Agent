@@ -3,6 +3,7 @@ import {
   AudioLines,
   CircleHelp,
   Headphones,
+  LoaderCircle,
   Mic,
   MicOff,
   Send,
@@ -121,7 +122,11 @@ function App() {
       setPending(false)
       setError(message.message || 'The backend could not process that turn.')
     } else if (message.status === 'audio_stopped') {
+      setPending(false)
       stopPlayback()
+    } else if (message.type === 'processing') {
+      setPending(true)
+      setError('')
     }
   }
 
@@ -325,8 +330,8 @@ function App() {
 
             <div className={`mic-stage ${isRecording ? 'recording' : ''}`}>
               <div className="stage-topline">
-                <span>{isRecording ? 'LISTENING' : 'HERE TO HELP'}</span>
-                <span className="stage-time">{isRecording ? 'YOUR TURN' : 'VOICE APPOINTMENTS'}</span>
+                <span>{pending ? 'WORKING ON IT' : isRecording ? 'LISTENING' : 'HERE TO HELP'}</span>
+                <span className="stage-time">{pending ? 'PLEASE WAIT' : isRecording ? 'YOUR TURN' : 'VOICE APPOINTMENTS'}</span>
               </div>
               <div className="mic-action-wrap">
                 <div className="waveform" aria-hidden="true">
@@ -351,8 +356,8 @@ function App() {
                 </div>
               </div>
               <div className="stage-caption">
-                <strong>{isRecording ? 'I’m listening' : 'Talk with Dr. Melvin’s office'}</strong>
-                <span>{isRecording ? 'Tell us what day or time works for you.' : 'Ask about availability or schedule a visit.'}</span>
+                <strong>{pending ? 'Preparing your appointment details' : isRecording ? 'I’m listening' : 'Talk with Dr. Melvin’s office'}</strong>
+                <span>{pending ? 'This may take a few moments.' : isRecording ? 'Tell us what day or time works for you.' : 'Ask about availability or schedule a visit.'}</span>
               </div>
             </div>
 
@@ -438,7 +443,13 @@ function App() {
                   </div>
                 </article>
               ))}
-              {pending && <div className="pending-line"><span /> Preparing a response…</div>}
+              {pending && (
+                <div className="pending-line" role="status" aria-live="polite">
+                  <LoaderCircle size={16} aria-hidden="true" />
+                  <span>Processing your request</span>
+                  <span className="pending-detail">Checking appointment details…</span>
+                </div>
+              )}
             </div>
 
             <footer className="transcript-footer">

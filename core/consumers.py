@@ -58,6 +58,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.pre_speech_buffer = bytearray()
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
+        self.speech_started_at = None
+        self.speech_vad_elapsed_seconds = 0.0
 
         initialization_started = time.perf_counter()
         logger.info("Pipeline connect: initializing voice services session=%s", self.session_id)
@@ -68,7 +70,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 asyncio.to_thread(_resolve_tts),
             )
             logger.info(
-                "Pipeline services ready session=%s elapsed_ms=%.0f",
+                "Pipeline services ready session=%s elapsed_ms=%.2f",
                 self.session_id,
                 (time.perf_counter() - initialization_started) * 1000,
             )
@@ -76,7 +78,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             self.llm = LLMService()
         except Exception:
             logger.exception(
-                "Pipeline connect failed while initializing services session=%s elapsed_ms=%.0f",
+                "Pipeline connect failed while initializing services session=%s elapsed_ms=%.2f",
                 self.session_id,
                 (time.perf_counter() - initialization_started) * 1000,
             )
@@ -102,6 +104,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 return
             clean_chunk = bytes_data[:aligned_len]
 
+            vad_started_at = time.perf_counter()
             try:
                 has_speech = await asyncio.to_thread(self.vad.is_speech, clean_chunk)
             except Exception:
@@ -111,6 +114,9 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                     len(clean_chunk),
                 )
                 raise
+            vad_elapsed = time.perf_counter() - vad_started_at
+            if self.speech_detected or has_speech:
+                self.speech_vad_elapsed_seconds += vad_elapsed
 
             if has_speech:
                 # 1. Handle user interruption: cut off active TTS / processing task
@@ -123,6 +129,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 # 2. Transition into speech-detected state
                 if not self.speech_detected:
                     self.speech_detected = True
+                    self.speech_started_at = vad_started_at
                     self.audio_buffer.extend(self.pre_speech_buffer)
                     logger.info(
                         "Pipeline VAD: speech started session=%s pre_speech_bytes=%s",
@@ -142,8 +149,12 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                         self.session_id,
                         len(audio_data),
                     )
+                    self._log_voice_endpoint_timing()
                     self._reset_speech_state()
-                    if not self._start_task(self.process_audio_pipeline(audio_data)):
+                    if not await self._start_task(
+                        self.process_audio_pipeline(audio_data),
+                        source="voice-max-duration",
+                    ):
                         await self._send_busy()
 
             else:
@@ -162,8 +173,12 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                                 len(audio_data),
                                 SILENCE_THRESHOLD_MS,
                             )
+                            self._log_voice_endpoint_timing()
                             self._reset_speech_state()
-                            if not self._start_task(self.process_audio_pipeline(audio_data)):
+                            if not await self._start_task(
+                                self.process_audio_pipeline(audio_data),
+                                source="voice-silence-endpoint",
+                            ):
                                 await self._send_busy()
                         else:
                             # Transient noise pop; discard
@@ -196,16 +211,22 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                     self.active_task.cancel()
                 self.active_task = None
 
+                await self.send(text_data=json.dumps({"status": "audio_stopped"}))
+
                 # If user had speech pending when stopping, finalize and process
                 if self.speech_detected and len(self.audio_buffer) >= MIN_SPEECH_BYTES:
                     audio_data = bytes(self.audio_buffer)
+                    self._log_voice_endpoint_timing()
                     logger.info(
                         "Pipeline stop: processing buffered speech session=%s audio_bytes=%s",
                         self.session_id,
                         len(audio_data),
                     )
                     self._reset_speech_state()
-                    self._start_task(self.process_audio_pipeline(audio_data))
+                    await self._start_task(
+                        self.process_audio_pipeline(audio_data),
+                        source="voice-stop",
+                    )
                 else:
                     if self.speech_detected:
                         logger.info(
@@ -215,7 +236,6 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                         )
                     self._reset_speech_state()
 
-                await self.send(text_data=json.dumps({"status": "audio_stopped"}))
                 return
 
             if action == "process_text_turn":
@@ -226,7 +246,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                         self.session_id,
                         len(user_text),
                     )
-                    if not self._start_task(self.run_dialog_and_respond(user_text)):
+                    if not await self._start_task(
+                        self.run_dialog_and_respond(user_text),
+                        source="text",
+                    ):
                         await self._send_busy()
                 else:
                     logger.warning("Pipeline receive: empty text turn session=%s", self.session_id)
@@ -238,29 +261,64 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.pre_speech_buffer.clear()
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
+        self.speech_started_at = None
+        self.speech_vad_elapsed_seconds = 0.0
 
-    def _start_task(self, coroutine):
+    def _log_voice_endpoint_timing(self):
+        if self.speech_started_at is None:
+            return
+
+        logger.info(
+            "Pipeline VAD: utterance endpointed session=%s speech_to_endpoint_ms=%.2f vad_compute_ms=%.2f",
+            self.session_id,
+            (time.perf_counter() - self.speech_started_at) * 1000,
+            self.speech_vad_elapsed_seconds * 1000,
+        )
+
+    async def _start_task(self, coroutine, source="voice"):
         if self.active_task and not self.active_task.done():
             coroutine.close()
             return False
 
-        logger.info("Pipeline turn: task started session=%s", self.session_id)
-        self.active_task = asyncio.create_task(self._run_safely(coroutine))
+        await self.send(text_data=json.dumps({
+            "type": "processing",
+            "message": "Processing your request.",
+        }))
+        started_at = time.perf_counter()
+        logger.info(
+            "Pipeline turn: started session=%s source=%s",
+            self.session_id,
+            source,
+        )
+        self.active_task = asyncio.create_task(
+            self._run_safely(coroutine, started_at, source)
+        )
         self.active_task.add_done_callback(self._clear_active_task)
         return True
 
-    async def _run_safely(self, coroutine):
+    async def _run_safely(self, coroutine, started_at, source):
+        outcome = "completed"
         try:
             await coroutine
         except asyncio.CancelledError:
+            outcome = "cancelled"
             logger.info("Pipeline turn: task cancelled session=%s", self.session_id)
             raise
         except Exception:
+            outcome = "failed"
             logger.exception("Pipeline turn failed session=%s", self.session_id)
             await self.send(text_data=json.dumps({
                 "type": "error",
                 "message": "The voice turn could not be processed.",
             }))
+        finally:
+            logger.info(
+                "Pipeline turn: total session=%s source=%s outcome=%s elapsed_ms=%.2f",
+                self.session_id,
+                source,
+                outcome,
+                (time.perf_counter() - started_at) * 1000,
+            )
 
     def _clear_active_task(self, task):
         if self.active_task is task:
@@ -285,6 +343,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             len(audio_data),
             len(audio_data) / BYTES_PER_MS,
         )
+        audio_preparation_started = time.perf_counter()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio_file:
             temp_audio_path = temp_audio_file.name
 
@@ -294,12 +353,17 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 audio_file.setsampwidth(AUDIO_SAMPLE_WIDTH)
                 audio_file.setframerate(AUDIO_SAMPLE_RATE)
                 audio_file.writeframes(audio_data)
+            logger.info(
+                "Pipeline STT: audio prepared session=%s elapsed_ms=%.2f",
+                self.session_id,
+                (time.perf_counter() - audio_preparation_started) * 1000,
+            )
 
             stt_started = time.perf_counter()
             logger.info("Pipeline STT: transcription started session=%s", self.session_id)
             user_text = await asyncio.to_thread(self.stt.transcribe, temp_audio_path)
             logger.info(
-                "Pipeline STT: transcription completed session=%s characters=%s elapsed_ms=%.0f",
+                "Pipeline STT: transcription completed session=%s characters=%s elapsed_ms=%.2f",
                 self.session_id,
                 len(user_text),
                 (time.perf_counter() - stt_started) * 1000,
@@ -340,7 +404,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
         response_text = response_text or ""
         logger.info(
-            "Pipeline dialog: completed session=%s response_characters=%s tool_status=%s elapsed_ms=%.0f",
+            "Pipeline dialog: completed session=%s response_characters=%s tool_status=%s elapsed_ms=%.2f",
             self.session_id,
             len(response_text),
             tool_status or "none",
@@ -356,7 +420,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             if audio_bytes:
                 audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
             logger.info(
-                "Pipeline TTS: synthesis completed session=%s audio_bytes=%s elapsed_ms=%.0f",
+                "Pipeline TTS: synthesis completed session=%s audio_bytes=%s elapsed_ms=%.2f",
                 self.session_id,
                 len(audio_bytes or b""),
                 (time.perf_counter() - tts_started) * 1000,
@@ -366,6 +430,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
         # Transcript Persistence with try-except fallback
         try:
+            persistence_started = time.perf_counter()
             logger.info("Pipeline persistence: saving transcript session=%s", self.session_id)
             await database_sync_to_async(
                 DataRepository.save_transcript,
@@ -374,12 +439,17 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 session_id=self.session_id,
                 full_transcript=f"User: {user_text} | Agent: {response_text}",
             )
-            logger.info("Pipeline persistence: transcript saved session=%s", self.session_id)
+            logger.info(
+                "Pipeline persistence: transcript saved session=%s elapsed_ms=%.2f",
+                self.session_id,
+                (time.perf_counter() - persistence_started) * 1000,
+            )
         except Exception:
             logger.exception("Pipeline persistence failed session=%s", self.session_id)
 
         # Send response to client with try-except fallback
         try:
+            delivery_started = time.perf_counter()
             logger.info("Pipeline delivery: sending response session=%s", self.session_id)
             await self.send(text_data=json.dumps({
                 "type": "agent_response",
@@ -388,6 +458,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 "tool_status": tool_status,
                 "audio_payload": audio_base64
             }))
-            logger.info("Pipeline delivery: response sent session=%s", self.session_id)
+            logger.info(
+                "Pipeline delivery: response sent session=%s elapsed_ms=%.2f",
+                self.session_id,
+                (time.perf_counter() - delivery_started) * 1000,
+            )
         except Exception:
             logger.exception("Pipeline delivery failed session=%s", self.session_id)

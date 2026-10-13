@@ -78,8 +78,10 @@ class VoiceConsumerTests(TransactionTestCase):
 					"text": "hello",
 				}))
 
+				processing = await self.communicator.receive_json_from(timeout=3)
 				response = await self.communicator.receive_json_from(timeout=3)
 
+			self.assertEqual(processing["type"], "processing")
 			log_output = "\n".join(pipeline_logs.output)
 			for stage in (
 				"Pipeline receive: action=process_text_turn",
@@ -88,8 +90,12 @@ class VoiceConsumerTests(TransactionTestCase):
 				"Pipeline TTS: synthesis started",
 				"Pipeline persistence: transcript saved",
 				"Pipeline delivery: response sent",
+				"Pipeline turn: total",
 			):
 				self.assertIn(stage, log_output)
+			self.assertRegex(log_output, r"Pipeline turn: total .*elapsed_ms=\d+(?:\.\d+)?")
+			self.assertRegex(log_output, r"Pipeline persistence: transcript saved .*elapsed_ms=\d+(?:\.\d+)?")
+			self.assertRegex(log_output, r"Pipeline delivery: response sent .*elapsed_ms=\d+(?:\.\d+)?")
 			self.assertNotIn("hello", log_output)
 
 			self.assertEqual(response["type"], "agent_response")
@@ -112,8 +118,10 @@ class VoiceConsumerTests(TransactionTestCase):
 			await self.communicator.send_to(bytes_data=speech_chunk)
 			await self.communicator.send_to(bytes_data=silence_chunk)
 
+			processing = await self.communicator.receive_json_from(timeout=3)
 			response = await self.communicator.receive_json_from(timeout=3)
 
+			self.assertEqual(processing["type"], "processing")
 			self.assertEqual(response["user_transcription"], "test transcription")
 			self.assertEqual(FakeSTTService.last_audio_parameters, (1, 2, 16000))
 		finally:
@@ -197,13 +205,24 @@ class GoogleCalendarServiceTests(TransactionTestCase):
 
 from core.services.vad_service import get_vad_service
 from core.services.vad_service import VADService
-from core.services.stt_service import get_stt_service
+from core.services.stt_service import STTService, get_stt_service
 from core.services.tts_service import get_tts_service
 from core.services.llm_service import LLMService
 from core.models import Doctor, Appointment, Task
 
 
 class VoiceOptimizationTests(TransactionTestCase):
+	def test_transcription_uses_beam_size_one(self):
+		service = STTService.__new__(STTService)
+		service.model = MagicMock()
+		service.model.transcribe.return_value = ([MagicMock(text="test transcript")], None)
+
+		result = service.transcribe(bytes(320))
+
+		self.assertEqual(result, "test transcript")
+		service.model.transcribe.assert_called_once()
+		self.assertEqual(service.model.transcribe.call_args.kwargs["beam_size"], 1)
+
 	def test_vad_trusts_silero_hub_repository(self):
 		with patch(
 			"core.services.vad_service.torch.hub.load",
@@ -238,6 +257,14 @@ class LLMServiceToolsTests(TransactionTestCase):
 			id=Doctor.SINGLETON_ID,
 			defaults={"name": "Dr. Melvin", "email": "musa813705@gmail.com"}
 		)
+
+	def test_system_instruction_identifies_clinic_calendar(self):
+		llm = LLMService()
+
+		instruction = llm._get_system_instruction()
+
+		self.assertIn("Dr. Melvin's clinic schedule", instruction)
+		self.assertIn("Never claim that the appointment was added to the caller's personal calendar", instruction)
 
 	def test_check_doctor_availability_without_calendar(self):
 		mock_cal = MagicMock()
@@ -291,14 +318,8 @@ class LLMServiceToolsTests(TransactionTestCase):
 
 	def test_process_dialog_fallback_on_error(self):
 		llm = LLMService()
-		mock_chat = MagicMock()
-		mock_chat.send_message.side_effect = Exception("Simulated API 429 Quota Error")
-		llm._chat = mock_chat
-
-		# Mock client so fallback also raises
-		mock_client = MagicMock()
-		mock_client.chats.create.side_effect = Exception("Simulated Secondary Error")
-		llm.client = mock_client
+		llm.client = MagicMock()
+		llm.client.chat.completions.create.side_effect = Exception("Simulated API error")
 
 		reply, tool = llm.process_dialog([], "test hello")
 		self.assertEqual(reply, "I am having trouble connecting to my scheduling system right now. Could you please repeat that?")
@@ -306,15 +327,60 @@ class LLMServiceToolsTests(TransactionTestCase):
 
 	def test_process_dialog_success(self):
 		llm = LLMService()
-		mock_chat = MagicMock()
-		mock_response = MagicMock()
-		mock_response.text = "Hello! Dr. Melvin is available."
-		mock_chat.send_message.return_value = mock_response
-		llm._chat = mock_chat
+		llm.client = MagicMock()
+		mock_message = MagicMock()
+		mock_message.content = "Hello! Dr. Melvin is available."
+		mock_message.tool_calls = None
+		llm.client.chat.completions.create.return_value.choices = [
+			MagicMock(message=mock_message)
+		]
 
 		history = []
-		reply, tool = llm.process_dialog(history, "hello doctor")
+		with self.assertLogs("core.services.llm_service", level="INFO") as timing_logs:
+			reply, tool = llm.process_dialog(history, "hello doctor")
+
+		self.assertTrue(any(
+			"Pipeline Groq: response received model=" in entry and "elapsed_ms=" in entry
+			for entry in timing_logs.output
+		))
 		self.assertEqual(reply, "Hello! Dr. Melvin is available.")
 		self.assertEqual(len(history), 2)
 		self.assertEqual(history[0]["role"], "user")
 		self.assertEqual(history[1]["role"], "assistant")
+
+	def test_process_dialog_executes_tool_and_sends_result_back(self):
+		llm = LLMService()
+		llm.client = MagicMock()
+		tool_call = MagicMock()
+		tool_call.id = "call-123"
+		tool_call.function.name = "check_doctor_availability"
+		tool_call.function.arguments = json.dumps({
+			"start_time": "2026-10-15T14:00:00Z",
+			"end_time": "2026-10-15T14:30:00Z",
+		})
+		tool_request = MagicMock()
+		tool_request.content = None
+		tool_request.tool_calls = [tool_call]
+		final_message = MagicMock()
+		final_message.content = "That time is available."
+		final_message.tool_calls = None
+		llm.client.chat.completions.create.side_effect = [
+			MagicMock(choices=[MagicMock(message=tool_request)]),
+			MagicMock(choices=[MagicMock(message=final_message)]),
+		]
+		llm.check_doctor_availability = MagicMock(return_value={"available": True})
+
+		history = []
+		reply, tool = llm.process_dialog(history, "Is the doctor free then?")
+
+		self.assertEqual(reply, "That time is available.")
+		llm.check_doctor_availability.assert_called_once_with(
+			start_time="2026-10-15T14:00:00Z",
+			end_time="2026-10-15T14:30:00Z",
+		)
+		second_request_messages = llm.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+		self.assertEqual(second_request_messages[-1]["role"], "tool")
+		self.assertEqual(second_request_messages[-1]["tool_call_id"], "call-123")
+		self.assertEqual(json.loads(second_request_messages[-1]["content"]), {"available": True})
+		self.assertEqual(tool, None)
+		self.assertEqual(len(history), 2)

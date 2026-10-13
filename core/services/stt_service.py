@@ -44,7 +44,7 @@ class STTService:
             return ""
 
         try:
-            segments, _ = self.model.transcribe(audio_data, beam_size=5)
+            segments, _ = self.model.transcribe(audio_data, beam_size=1)
             transcript = " ".join([segment.text for segment in segments])
             return transcript.strip()
         except Exception as e:

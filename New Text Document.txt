@@ -1,0 +1,21 @@
+[React Voice UI] (Microphone Input & Audio Playback)
+       │ 
+       │ (WebSocket Audio Chunks & Control Signals)
+       ▼
+[Django Channels (ASGI)] 
+       │
+       ├─► [VAD Layer] (Silero VAD running locally on CPU)
+       │     └─► Detects speech start/end & handles user interruptions (cuts off TTS stream)
+       │
+       ├─► [STT Layer] (Faster-Whisper - Tiny/Base optimized for CPU)
+       │
+       ├─► [Dialog LLM & Tool-Calling Loop]
+       │     ├─► Intent Parsing & Conversation State
+       │     └─► Google Calendar Tool (Checks availability)
+       │           ├─ If Available ──► Books event & saves to DB
+       │           └─ If Busy/Conflict ──► Returns conflict status to LLM 
+       │                 └─► LLM prompts user for alternative time ("Doctor is busy at 3 PM, how about 4 PM?")
+       │
+       ├─► [TTS Layer] (Lightweight local TTS like Kokoro-82M for CPU speed)
+       │
+       └─► [Database Layer] (Django ORM + MySQL - structured with service abstraction for easy future migration)

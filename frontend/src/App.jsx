@@ -53,54 +53,117 @@ function App() {
   const [error, setError] = useState('')
   const socketRef = useRef(null)
   const socketPromiseRef = useRef(null)
+  const socketGenerationRef = useRef(0)
   const streamRef = useRef(null)
   const contextRef = useRef(null)
   const sourceRef = useRef(null)
   const processorRef = useRef(null)
   const recordingRef = useRef(false)
-  const audioRef = useRef(null)
-  const audioUrlRef = useRef(null)
+  const playbackContextRef = useRef(null)
+  const playbackSourcesRef = useRef(new Set())
+  const playbackTurnRef = useRef(null)
+  const playbackSequenceRef = useRef(0)
+  const playbackNextTimeRef = useRef(0)
+  const playbackCompleteRef = useRef(false)
+  const playbackGenerationRef = useRef(0)
+  const playbackQueueRef = useRef(Promise.resolve())
+  const cancelledAudioTurnRef = useRef(0)
+  const latestAudioTurnRef = useRef(null)
 
   const stopPlayback = () => {
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current.currentTime = 0
-      audioRef.current = null
+    playbackGenerationRef.current += 1
+    playbackSourcesRef.current.forEach((source) => source.stop())
+    playbackSourcesRef.current.clear()
+    if (playbackContextRef.current && playbackContextRef.current.state !== 'closed') {
+      playbackContextRef.current.close()
     }
-    if (audioUrlRef.current) {
-      URL.revokeObjectURL(audioUrlRef.current)
-      audioUrlRef.current = null
-    }
+    playbackContextRef.current = null
+    playbackTurnRef.current = null
+    playbackSequenceRef.current = 0
+    playbackNextTimeRef.current = 0
+    playbackCompleteRef.current = false
     setIsPlaying(false)
   }
 
-  const playReply = (audioPayload) => {
-    if (!audioPayload) return
-    stopPlayback()
-
-    const binary = window.atob(audioPayload)
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index)
-    }
-
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }))
-    const audio = new Audio(url)
-    audioRef.current = audio
-    audioUrlRef.current = url
-    audio.onended = stopPlayback
-    audio.onerror = () => {
-      setError('The reply audio could not be played.')
-      stopPlayback()
-    }
-    setIsPlaying(true)
-    audio.play().catch(() => {
-      setError('Audio playback was blocked. Use the play control in your browser.')
+  const finishPlaybackIfReady = () => {
+    if (playbackCompleteRef.current && playbackSourcesRef.current.size === 0) {
+      if (playbackContextRef.current && playbackContextRef.current.state !== 'closed') {
+        playbackContextRef.current.close()
+      }
+      playbackContextRef.current = null
+      playbackTurnRef.current = null
+      playbackSequenceRef.current = 0
+      playbackNextTimeRef.current = 0
+      playbackCompleteRef.current = false
       setIsPlaying(false)
-    })
+    }
   }
 
-  const handleSocketMessage = (event) => {
+  const queueAudioChunk = async (message, socketGeneration) => {
+    if (socketGeneration !== socketGenerationRef.current) return
+    if (message.turn_id <= cancelledAudioTurnRef.current) return
+    if (message.format !== 'pcm_s16le' || message.channels !== 1) {
+      throw new Error('Received an unsupported audio format.')
+    }
+    if (!Number.isInteger(message.sample_rate) || message.sample_rate <= 0) {
+      throw new Error('Received an invalid audio sample rate.')
+    }
+    if (playbackTurnRef.current !== message.turn_id) {
+      stopPlayback()
+      playbackTurnRef.current = message.turn_id
+    }
+    if (message.sequence !== playbackSequenceRef.current) {
+      throw new Error('Received audio chunks out of order.')
+    }
+    const generation = playbackGenerationRef.current
+
+    const binary = window.atob(message.audio_payload)
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+    if (bytes.byteLength % 2) {
+      throw new Error('Received invalid 16-bit audio data.')
+    }
+
+    const sampleCount = bytes.byteLength / 2
+    const samples = new Float32Array(sampleCount)
+    const dataView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    for (let index = 0; index < sampleCount; index += 1) {
+      samples[index] = dataView.getInt16(index * 2, true) / 32768
+    }
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextClass) throw new Error('This browser does not support Web Audio.')
+    if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+      playbackContextRef.current = new AudioContextClass()
+      playbackNextTimeRef.current = playbackContextRef.current.currentTime + 0.05
+    }
+    const context = playbackContextRef.current
+    if (context.state === 'suspended') await context.resume()
+    if (
+      socketGeneration !== socketGenerationRef.current
+      ||
+      generation !== playbackGenerationRef.current
+      || playbackTurnRef.current !== message.turn_id
+    ) return
+
+    const audioBuffer = context.createBuffer(1, sampleCount, message.sample_rate)
+    audioBuffer.copyToChannel(samples, 0)
+    const source = context.createBufferSource()
+    source.buffer = audioBuffer
+    source.connect(context.destination)
+    playbackSourcesRef.current.add(source)
+    source.onended = () => {
+      playbackSourcesRef.current.delete(source)
+      finishPlaybackIfReady()
+    }
+    const startAt = Math.max(context.currentTime + 0.01, playbackNextTimeRef.current)
+    source.start(startAt)
+    playbackNextTimeRef.current = startAt + audioBuffer.duration
+    playbackSequenceRef.current += 1
+    setIsPlaying(true)
+  }
+
+  const handleSocketMessage = (event, socketGeneration) => {
+    if (socketGeneration !== socketGenerationRef.current) return
     let message
     try {
       message = JSON.parse(event.data)
@@ -117,11 +180,31 @@ function App() {
       }))
       setPending(false)
       setError('')
-      playReply(message.audio_payload)
+      playbackQueueRef.current = playbackQueueRef.current.then(() => {
+        if (socketGeneration !== socketGenerationRef.current) return
+        if (playbackTurnRef.current === message.turn_id) {
+          playbackCompleteRef.current = true
+          finishPlaybackIfReady()
+        }
+      })
+    } else if (message.type === 'audio_chunk') {
+      latestAudioTurnRef.current = message.turn_id
+      playbackQueueRef.current = playbackQueueRef.current
+        .then(() => queueAudioChunk(message, socketGeneration))
+        .catch((playbackError) => {
+          setError(playbackError.message || 'The reply audio could not be played.')
+          stopPlayback()
+        })
     } else if (message.type === 'error') {
       setPending(false)
       setError(message.message || 'The backend could not process that turn.')
     } else if (message.status === 'audio_stopped') {
+      if (Number.isInteger(message.turn_id)) {
+        cancelledAudioTurnRef.current = Math.max(
+          cancelledAudioTurnRef.current,
+          message.turn_id,
+        )
+      }
       setPending(false)
       stopPlayback()
     } else if (message.type === 'processing') {
@@ -148,9 +231,13 @@ function App() {
 
     setConnectionState('connecting')
     setError('')
+    const socketGeneration = ++socketGenerationRef.current
+    cancelledAudioTurnRef.current = 0
+    latestAudioTurnRef.current = null
+    playbackQueueRef.current = Promise.resolve()
     const socket = new WebSocket(parsedUrl.toString())
     socketRef.current = socket
-    socket.onmessage = handleSocketMessage
+    socket.onmessage = (event) => handleSocketMessage(event, socketGeneration)
 
     const connection = new Promise((resolve, reject) => {
       let opened = false
@@ -171,6 +258,10 @@ function App() {
       }
       socket.onclose = () => {
         window.clearTimeout(timeoutId)
+        if (socketGenerationRef.current === socketGeneration) {
+          socketGenerationRef.current += 1
+          stopPlayback()
+        }
         setConnectionState('disconnected')
         setPending(false)
         if (recordingRef.current) stopMicrophone(false)
@@ -260,6 +351,7 @@ function App() {
 
   const disconnect = async () => {
     await stopMicrophone()
+    socketGenerationRef.current += 1
     stopPlayback()
     if (socketRef.current && socketRef.current.readyState < WebSocket.CLOSING) {
       socketRef.current.close(1000, 'Session ended')
@@ -269,6 +361,14 @@ function App() {
   }
 
   const interrupt = () => {
+    const turnToCancel = Math.max(
+      playbackTurnRef.current || 0,
+      latestAudioTurnRef.current || 0,
+    )
+    cancelledAudioTurnRef.current = Math.max(
+      cancelledAudioTurnRef.current,
+      turnToCancel,
+    )
     stopPlayback()
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ action: 'stop_audio' }))

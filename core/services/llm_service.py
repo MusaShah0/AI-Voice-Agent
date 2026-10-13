@@ -308,43 +308,34 @@ class LLMService:
         messages.append({"role": "user", "content": user_input})
         return messages
 
-    @staticmethod
-    def _serialize_assistant_message(message) -> Dict[str, Any]:
-        serialized = {"role": "assistant", "content": message.content or ""}
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if tool_calls:
-            serialized["tool_calls"] = [
-                {
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
-                    },
-                }
-                for call in tool_calls
-            ]
-        return serialized
-
     def process_dialog(
         self,
         conversation_history: list,
         user_input: str
     ) -> Tuple[str, Optional[str]]:
+        response_text = "".join(
+            self.stream_dialog(conversation_history, user_input)
+        )
+        return response_text, self.last_tool_status
+
+    def stream_dialog(self, conversation_history: list, user_input: str):
         """
-        Manages dialog turn, executes LLM tool calling (availability check and booking),
-        and returns the natural assistant text reply and tool execution status.
+        Streams assistant text while executing any requested scheduling tools first.
         """
         self.last_tool_status = None
         user_input = (user_input or "").strip()
         if not user_input:
-            return "I am listening. How can I help you today?", None
+            yield "I am listening. How can I help you today?"
+            return
 
         if self.client is None:
             logger.error("Groq client is uninitialized (missing GROQ_API_KEY or client initialization failure).")
-            return "I am having trouble connecting to my scheduling system right now. Could you please repeat that?", "error"
+            self.last_tool_status = "error"
+            yield "I am having trouble connecting to my scheduling system right now. Could you please repeat that?"
+            return
 
-        response_text = ""
+        response_text = []
+        completed = False
         messages = self._build_messages(conversation_history, user_input)
         tool_handlers = {
             "check_doctor_availability": self.check_doctor_availability,
@@ -355,12 +346,14 @@ class LLMService:
             for request_number in range(self.MAX_TOOL_CALL_ROUNDS + 1):
                 request_started_at = time.perf_counter()
                 try:
-                    response = self.client.chat.completions.create(
+                    stream = self.client.chat.completions.create(
                         model=self.model_name,
                         messages=messages,
                         tools=self.TOOL_DEFINITIONS,
                         tool_choice="auto",
                         max_completion_tokens=300,
+                        reasoning_effort="low",
+                        stream=True,
                     )
                 except Exception:
                     logger.exception(
@@ -371,33 +364,72 @@ class LLMService:
                     )
                     raise
 
+                tool_call_fragments = {}
+                try:
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+                        content = getattr(delta, "content", None)
+                        if content:
+                            response_text.append(content)
+                            yield content
+
+                        for tool_delta in getattr(delta, "tool_calls", None) or []:
+                            tool_fragment = tool_call_fragments.setdefault(
+                                tool_delta.index,
+                                {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tool_delta.id:
+                                tool_fragment["id"] = tool_delta.id
+                            function_delta = tool_delta.function
+                            if function_delta.name:
+                                tool_fragment["function"]["name"] += function_delta.name
+                            if function_delta.arguments:
+                                tool_fragment["function"]["arguments"] += function_delta.arguments
+                finally:
+                    stream.close()
+
                 logger.info(
-                    "Pipeline Groq: response received model=%s elapsed_ms=%.2f request=%s",
+                    "Pipeline Groq: response stream completed model=%s elapsed_ms=%.2f request=%s",
                     self.model_name,
                     (time.perf_counter() - request_started_at) * 1000,
                     request_number + 1,
                 )
-                message = response.choices[0].message
-                tool_calls = getattr(message, "tool_calls", None) or []
+                tool_calls = [
+                    tool_call_fragments[index]
+                    for index in sorted(tool_call_fragments)
+                ]
                 if not tool_calls:
-                    response_text = (message.content or "").strip()
-                    if not response_text:
+                    if not "".join(response_text).strip():
                         raise ValueError("Groq response had neither message text nor tool calls")
+                    completed = True
                     break
+
+                if response_text:
+                    raise ValueError("Groq streamed text and tool calls in the same response")
 
                 if request_number == self.MAX_TOOL_CALL_ROUNDS:
                     raise RuntimeError("Groq exceeded the maximum number of tool-call rounds")
 
-                messages.append(self._serialize_assistant_message(message))
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls,
+                })
                 for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
+                    tool_name = tool_call["function"]["name"]
                     handler = tool_handlers.get(tool_name)
                     if handler is None:
                         result = {"status": "error", "message": "Unknown scheduling tool."}
                         self.last_tool_status = "error"
                     else:
                         try:
-                            arguments = json.loads(tool_call.function.arguments or "{}")
+                            arguments = json.loads(tool_call["function"]["arguments"] or "{}")
                         except (TypeError, json.JSONDecodeError):
                             result = {"status": "error", "message": "Tool arguments were not valid JSON."}
                             self.last_tool_status = "error"
@@ -407,11 +439,16 @@ class LLMService:
                                 self.last_tool_status = "error"
                             else:
                                 logger.info("Pipeline Groq: executing tool=%s", tool_name)
-                                result = handler(**arguments)
+                                try:
+                                    result = handler(**arguments)
+                                except Exception as tool_err:
+                                    logger.exception("Groq tool execution failed tool=%s", tool_name)
+                                    result = {"status": "error", "message": str(tool_err)}
+                                    self.last_tool_status = "error"
 
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
+                        "tool_call_id": tool_call["id"],
                         "name": tool_name,
                         "content": json.dumps(result, default=str),
                     })
@@ -419,15 +456,19 @@ class LLMService:
                 raise RuntimeError("Groq tool-call loop ended without a final response")
         except Exception as err:
             logger.exception("Groq dialog failed model=%s error=%s", self.model_name, err)
-            response_text = "I am having trouble connecting to my scheduling system right now. Could you please repeat that?"
+            error_reply = "I am having trouble connecting to my scheduling system right now. Could you please repeat that?"
+            if response_text:
+                error_reply = " I am having trouble completing that response. Please ask me to repeat it."
+            response_text.append(error_reply)
+            yield error_reply
             self.last_tool_status = "error"
 
-        # Update outer conversation history
-        try:
-            conversation_history.append({"role": "user", "content": user_input})
-            conversation_history.append({"role": "assistant", "content": response_text})
-        except Exception as hist_err:
-            logger.warning("Failed to update conversation history: %s", hist_err)
-
-        tool_triggered = self.last_tool_status
-        return response_text, tool_triggered
+        if completed or self.last_tool_status == "error":
+            try:
+                conversation_history.append({"role": "user", "content": user_input})
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": "".join(response_text),
+                })
+            except Exception as hist_err:
+                logger.warning("Failed to update conversation history: %s", hist_err)

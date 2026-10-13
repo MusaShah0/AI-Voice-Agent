@@ -1,7 +1,9 @@
-import io
 import logging
-from typing import Optional
-from gtts import gTTS
+import os
+from pathlib import Path
+from typing import Optional, Tuple
+
+from piper import PiperVoice
 
 logger = logging.getLogger(__name__)
 
@@ -9,31 +11,53 @@ _tts_singleton: Optional["TTSService"] = None
 
 
 class TTSService:
-    def __init__(self, lang="en", slow=False):
-        self.lang = lang
-        self.slow = slow
+    def __init__(self):
+        default_voice_path = (
+            Path(__file__).resolve().parents[2]
+            / "models"
+            / "piper"
+            / "en_US-lessac-medium.onnx"
+        )
+        configured_voice_path = Path(
+            os.environ.get("PIPER_VOICE_PATH", str(default_voice_path))
+        )
+        if not configured_voice_path.is_absolute():
+            configured_voice_path = Path(__file__).resolve().parents[2] / configured_voice_path
+        if not configured_voice_path.is_file():
+            raise FileNotFoundError(
+                f"Piper voice model not found at {configured_voice_path}. "
+                "Download en_US-lessac-medium with "
+                "`python -m piper.download_voices --download-dir models/piper en_US-lessac-medium`."
+            )
 
-    def synthesize(self, text: str) -> bytes:
-        """
-        Converts text response into raw audio bytes (MP3 format) 
-        optimized for lightweight CPU execution.
-        """
+        logger.info("Loading local Piper voice from %s", configured_voice_path)
+        self.voice = PiperVoice.load(configured_voice_path)
+        self.sample_rate = self.voice.config.sample_rate
+        logger.info("Local Piper voice ready sample_rate=%s", self.sample_rate)
+
+    def synthesize(self, text: str) -> Tuple[bytes, int]:
+        """Synthesize text into mono signed 16-bit PCM and return audio plus sample rate."""
         if not text.strip():
-            return b""
+            return b"", self.sample_rate
 
-        try:
-            fp = io.BytesIO()
-            tts = gTTS(text=text, lang=self.lang, slow=self.slow)
-            tts.write_to_fp(fp)
-            fp.seek(0)
-            return fp.read()
-        except Exception as e:
-            logger.error("TTS Synthesis Error: %s", e)
-            return b""
+        audio_chunks = []
+        for chunk in self.voice.synthesize(text):
+            if chunk.sample_width != 2 or chunk.sample_channels != 1:
+                raise ValueError(
+                    "Piper voice must produce mono 16-bit PCM audio "
+                    f"(got sample_width={chunk.sample_width}, channels={chunk.sample_channels})"
+                )
+            if chunk.sample_rate != self.sample_rate:
+                raise ValueError(
+                    f"Piper sample rate changed during synthesis: {chunk.sample_rate}"
+                )
+            audio_chunks.append(chunk.audio_int16_bytes)
+
+        return b"".join(audio_chunks), self.sample_rate
 
 
-def get_tts_service(lang: str = "en", slow: bool = False) -> TTSService:
+def get_tts_service() -> TTSService:
     global _tts_singleton
     if _tts_singleton is None:
-        _tts_singleton = TTSService(lang=lang, slow=slow)
-    return _tts_singleton
+        _tts_singleton = TTSService()
+    return _tts_singleton

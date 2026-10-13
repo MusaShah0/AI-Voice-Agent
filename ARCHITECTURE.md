@@ -43,15 +43,15 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │    • SQLite Database via Django ORM (Doctor, Appointment,     │
  │      Task, Transcript)                                        │
  │                                                               │
- │ 5. TTS Layer (gTTS on CPU)                                    │
- │    • Synthesizes response text into MP3 byte payload          │
- │    • Encoded as Base64 string                                 │
+ │ 5. TTS Layer (local Piper "en_US-lessac-medium")              │
+ │    • Groq final answer streams sentence by sentence           │
+ │    • Piper generates local mono PCM; sent as ordered chunks   │
  └───────────────────────────────┬───────────────────────────────┘
                                  │
-                                 │ JSON: {type: "agent_response", caption, tool_status, audio_payload}
+                                 │ JSON: audio_chunk PCM frames + agent_response caption
                                  ▼
                      [React Voice UI Playback]
-              (HTML5 Audio Blob + Real-time Captions)
+              (Web Audio PCM queue + Real-time Captions)
 ```
 
 ### Detailed Sequence of a Voice Turn
@@ -62,14 +62,22 @@ The system coordinates a real-time conversational voice loop connecting a React 
    - If the user speaks while the agent is playing an earlier response, the active turn task is immediately cancelled, and `{"status": "audio_stopped"}` is dispatched to cut off frontend audio playback.
 3. **Endpointing**: When `consecutive_silence_bytes` reaches 700ms (`SILENCE_THRESHOLD_BYTES = 22,400 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
 4. **Transcription (STT)**: The accumulated PCM bytes are wrapped in a 16kHz mono WAV header and transcribed using `Faster-Whisper` (`compute_type="int8"` on CPU).
-5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.process_dialog()`. Groq determines whether to call tools or respond directly:
+5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.stream_dialog()`. Groq streams the final answer; any requested scheduling tools are executed before its spoken confirmation:
    - Queries `check_doctor_availability(start_time, end_time)` to inspect Google Calendar freebusy and SQLite DB.
    - If a conflict exists, it informs the caller and suggests alternative slots.
    - Once the user confirms, it executes `book_appointment(caller_name, start_time, end_time, purpose)`.
-6. **Speech Synthesis (TTS)**: The text reply is converted into MP3 bytes via `TTSService.synthesize()` on a worker thread.
+6. **Speech Synthesis (TTS)**: As streamed text reaches sentence boundaries, `VoiceConsumer` synthesizes each sentence locally with Piper on a worker thread. A bounded queue lets Groq continue generating while Piper synthesizes the previous sentence.
 7. **Persistence**: The full turn (`User: ... | Agent: ...`) is saved to the `Transcript` table linked to the unique session ID.
-8. **Delivery**: A JSON message with base64 audio and text captions is dispatched over the WebSocket.
-9. **Playback**: The frontend converts the base64 payload into a `Blob`, instantiates an HTML5 `Audio` element, updates captions, and plays the response.
+8. **Delivery**: Each synthesized sentence is sent as ordered, Base64-encoded mono PCM chunks; the final `agent_response` carries the complete caption and tool status.
+9. **Playback**: The frontend converts PCM samples into Web Audio buffers and schedules them consecutively as they arrive. Barge-in stops all queued audio for the interrupted turn.
+
+### Local Piper Voice Setup
+
+Install Python dependencies, then download the default voice model once:
+```powershell
+python -m piper.download_voices --download-dir models/piper en_US-lessac-medium
+```
+The application expects `models/piper/en_US-lessac-medium.onnx` by default. Set `PIPER_VOICE_PATH` to an alternate ONNX voice file if needed. Piper synthesis runs locally after the voice model is installed; it does not send response text to a hosted TTS service.
 
 ---
 
@@ -113,37 +121,55 @@ Sent when the user clicks the Stop/Mute button or begins speaking during playbac
 
 ### B. Outbound Messages (Server to Client)
 
-#### 1. Agent Response Payload
-Emitted when a conversational turn (voice or text) completes.
+#### 1. Audio Chunk
+Emitted as local Piper synthesis produces audio for each completed sentence.
+```json
+{
+  "type": "audio_chunk",
+  "turn_id": 1,
+  "sequence": 0,
+  "format": "pcm_s16le",
+  "channels": 1,
+  "sample_rate": 22050,
+  "audio_payload": "base64-encoded PCM bytes"
+}
+```
+- `turn_id` (integer): Turn identifier used to discard audio after interruption.
+- `sequence` (integer): Zero-based order of PCM frames within the turn.
+- `format` (string): Signed 16-bit little-endian PCM.
+- `audio_payload` (string): Base64-encoded audio frame; frame size is at most 8192 bytes.
+
+#### 2. Agent Response
+Sent after the final audio chunk for the turn.
 ```json
 {
   "type": "agent_response",
+  "turn_id": 1,
   "user_transcription": "Is Dr. Smith available tomorrow at 2 PM?",
-  "caption": "Dr. Smith is completely free tomorrow from 2:00 PM to 2:30 PM. Would you like to schedule an appointment?",
-  "tool_status": "availability_checked",
-  "audio_payload": "//uQxAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAA..."
+  "caption": "Dr. Melvin is available tomorrow at 2 PM.",
+  "tool_status": "availability_checked"
 }
 ```
-- `type` (string): Always `"agent_response"`.
-- `user_transcription` (string): The STT transcribed text (or original text if submitted via input box).
-- `caption` (string): The verbal response generated by the configured Groq model.
-- `tool_status` (string | null): The execution status of tools triggered during this turn:
+- `caption` (string): The complete verbal response streamed from the configured Groq model.
+- `tool_status` (string | null): Scheduling tool status as described below.
+
+Scheduling tool status values:
   - `"availability_checked"`: Availability query executed, slot is open.
   - `"conflict_detected"`: Slot is occupied on Google Calendar or DB.
   - `"calendar_booked"`: Appointment confirmed and written to DB + Google Calendar.
   - `null`: Pure conversational turn (no tool invoked).
   - `"error"`: Tool execution failed.
-- `audio_payload` (string): Standard Base64-encoded MP3 audio generated by gTTS.
 
-#### 2. Audio Interruption / Cutoff Signal
+#### 3. Audio Interruption / Cutoff Signal
 Emitted when an active turn is cancelled due to user barge-in.
 ```json
 {
-  "status": "audio_stopped"
+  "status": "audio_stopped",
+  "turn_id": 1
 }
 ```
 
-#### 3. Error Notification
+#### 4. Error Notification
 Emitted if an unrecoverable failure occurs during processing.
 ```json
 {
@@ -292,13 +318,11 @@ class Transcript(models.Model):
 ---
 
 ### `core/services/tts_service.py`
-**Responsibility**: Text-to-Speech synthesis converting agent replies into MP3 audio on CPU.
+**Responsibility**: Local sentence-by-sentence speech synthesis to mono PCM using Piper.
 
-- `TTSService.__init__(self, lang="en", slow=False)`: Configures language and cadence.
-- `synthesize(self, text: str) -> bytes`:
-  - Uses `gTTS` to stream synthesized speech directly into an in-memory `io.BytesIO` buffer.
-  - Returns raw MP3 `bytes`.
-- `get_tts_service(lang="en", slow=False) -> TTSService`: Module-level singleton provider.
+- `TTSService.__init__(self)`: Loads the `en_US-lessac-medium` ONNX voice from `PIPER_VOICE_PATH` or `models/piper/en_US-lessac-medium.onnx`.
+- `synthesize(self, text: str) -> Tuple[bytes, int]`: Generates local signed 16-bit mono PCM and returns `(audio_bytes, sample_rate)`.
+- `get_tts_service() -> TTSService`: Module-level singleton provider.
 
 ---
 
@@ -396,5 +420,5 @@ Open **`http://localhost:3000`** in Google Chrome or Microsoft Edge.
 - [x] **Faster-Whisper STT**: Transcribes voice to text in ~1-2 seconds on CPU.
 - [x] **LLM Tool Calling**: Groq's configured model executes free/busy checks and appointment bookings.
 - [x] **Database Persistence**: Appointments, tasks, and dialogue transcripts persist to SQLite.
-- [x] **gTTS Audio Synthesis**: MP3 audio streams back as Base64 payload and plays in the browser.
+- [x] **Streaming Speech Playback**: Groq sentence output is synthesized by local Piper, relayed as PCM chunks, and queued with Web Audio.
 - [x] **Interruption / Barge-in**: User speaking mid-reply cuts off playback immediately.

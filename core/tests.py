@@ -1,6 +1,7 @@
 import base64
 import json
 import wave
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from channels.db import database_sync_to_async
@@ -39,23 +40,57 @@ class FakeSTTService:
 
 
 class FakeLLMService:
-	def process_dialog(self, conversation_history, user_input):
-		return "test response", None
+	last_tool_status = None
+
+	def stream_dialog(self, conversation_history, user_input):
+		yield "Dr. Melvin is available. "
+		yield "Would you like to book?"
 
 
 class FakeTTSService:
+	def __init__(self):
+		self.inputs = []
+
 	def synthesize(self, text):
-		return b"test audio"
+		self.inputs.append(text)
+		return b"test audio", 22050
+
+
+class FakeGroqStream:
+	def __init__(self, chunks):
+		self.chunks = chunks
+
+	def __iter__(self):
+		return iter(self.chunks)
+
+	def close(self):
+		pass
+
+
+def groq_content_chunk(content):
+	return MagicMock(choices=[MagicMock(delta=MagicMock(content=content, tool_calls=None))])
+
+
+def groq_tool_call_chunk(call_id, name, arguments, index=0):
+	tool_call = MagicMock(
+		index=index,
+		id=call_id,
+		function=SimpleNamespace(name=name, arguments=arguments),
+	)
+	return MagicMock(choices=[MagicMock(
+		delta=MagicMock(content=None, tool_calls=[tool_call])
+	)])
 
 
 class VoiceConsumerTests(TransactionTestCase):
 	def setUp(self):
 		self.fake_vad = FakeVADService()
+		self.fake_tts = FakeTTSService()
 		self.patches = [
 			patch("core.consumers.VADService", return_value=self.fake_vad),
 			patch("core.consumers.STTService", return_value=FakeSTTService("base")),
 			patch("core.consumers.LLMService", return_value=FakeLLMService()),
-			patch("core.consumers.TTSService", return_value=FakeTTSService()),
+			patch("core.consumers.TTSService", return_value=self.fake_tts),
 		]
 		for service_patch in self.patches:
 			service_patch.start()
@@ -79,7 +114,13 @@ class VoiceConsumerTests(TransactionTestCase):
 				}))
 
 				processing = await self.communicator.receive_json_from(timeout=3)
-				response = await self.communicator.receive_json_from(timeout=3)
+				stream_messages = []
+				while True:
+					message = await self.communicator.receive_json_from(timeout=3)
+					if message["type"] == "agent_response":
+						response = message
+						break
+					stream_messages.append(message)
 
 			self.assertEqual(processing["type"], "processing")
 			log_output = "\n".join(pipeline_logs.output)
@@ -87,7 +128,8 @@ class VoiceConsumerTests(TransactionTestCase):
 				"Pipeline receive: action=process_text_turn",
 				"Pipeline dialog: started",
 				"Pipeline dialog: completed",
-				"Pipeline TTS: synthesis started",
+				"Pipeline TTS: streaming synthesis started",
+				"Pipeline TTS: sentence synthesized",
 				"Pipeline persistence: transcript saved",
 				"Pipeline delivery: response sent",
 				"Pipeline turn: total",
@@ -99,12 +141,25 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertNotIn("hello", log_output)
 
 			self.assertEqual(response["type"], "agent_response")
-			self.assertEqual(response["caption"], "test response")
-			self.assertEqual(base64.b64decode(response["audio_payload"]), b"test audio")
+			self.assertEqual(response["caption"], "Dr. Melvin is available. Would you like to book?")
+			self.assertEqual(response["turn_id"], 1)
+			self.assertEqual(
+				self.fake_tts.inputs,
+				["Dr. Melvin is available.", "Would you like to book?"],
+			)
+			self.assertTrue(stream_messages)
+			self.assertTrue(all(message["type"] == "audio_chunk" for message in stream_messages))
+			self.assertEqual(
+				b"".join(base64.b64decode(message["audio_payload"]) for message in stream_messages),
+				b"test audio" * len(self.fake_tts.inputs),
+			)
 			transcript = await database_sync_to_async(
 				lambda: Transcript.objects.get(session_id__startswith="session_")
 			)()
-			self.assertEqual(transcript.full_transcript, "User: hello | Agent: test response")
+			self.assertEqual(
+				transcript.full_transcript,
+				"User: hello | Agent: Dr. Melvin is available. Would you like to book?",
+			)
 		finally:
 			await self.communicator.disconnect()
 
@@ -119,10 +174,17 @@ class VoiceConsumerTests(TransactionTestCase):
 			await self.communicator.send_to(bytes_data=silence_chunk)
 
 			processing = await self.communicator.receive_json_from(timeout=3)
-			response = await self.communicator.receive_json_from(timeout=3)
+			stream_messages = []
+			while True:
+				message = await self.communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					response = message
+					break
+				stream_messages.append(message)
 
 			self.assertEqual(processing["type"], "processing")
 			self.assertEqual(response["user_transcription"], "test transcription")
+			self.assertTrue(stream_messages)
 			self.assertEqual(FakeSTTService.last_audio_parameters, (1, 2, 16000))
 		finally:
 			await self.communicator.disconnect()
@@ -328,21 +390,24 @@ class LLMServiceToolsTests(TransactionTestCase):
 	def test_process_dialog_success(self):
 		llm = LLMService()
 		llm.client = MagicMock()
-		mock_message = MagicMock()
-		mock_message.content = "Hello! Dr. Melvin is available."
-		mock_message.tool_calls = None
-		llm.client.chat.completions.create.return_value.choices = [
-			MagicMock(message=mock_message)
-		]
+		llm.client.chat.completions.create.return_value = FakeGroqStream([
+			groq_content_chunk("Hello! "),
+			groq_content_chunk("Dr. Melvin is available."),
+		])
 
 		history = []
 		with self.assertLogs("core.services.llm_service", level="INFO") as timing_logs:
 			reply, tool = llm.process_dialog(history, "hello doctor")
 
 		self.assertTrue(any(
-			"Pipeline Groq: response received model=" in entry and "elapsed_ms=" in entry
+			"Pipeline Groq: response stream completed model=" in entry and "elapsed_ms=" in entry
 			for entry in timing_logs.output
 		))
+		self.assertTrue(llm.client.chat.completions.create.call_args.kwargs["stream"])
+		self.assertEqual(
+			llm.client.chat.completions.create.call_args.kwargs["reasoning_effort"],
+			"low",
+		)
 		self.assertEqual(reply, "Hello! Dr. Melvin is available.")
 		self.assertEqual(len(history), 2)
 		self.assertEqual(history[0]["role"], "user")
@@ -351,22 +416,19 @@ class LLMServiceToolsTests(TransactionTestCase):
 	def test_process_dialog_executes_tool_and_sends_result_back(self):
 		llm = LLMService()
 		llm.client = MagicMock()
-		tool_call = MagicMock()
-		tool_call.id = "call-123"
-		tool_call.function.name = "check_doctor_availability"
-		tool_call.function.arguments = json.dumps({
+		arguments = json.dumps({
 			"start_time": "2026-10-15T14:00:00Z",
 			"end_time": "2026-10-15T14:30:00Z",
 		})
-		tool_request = MagicMock()
-		tool_request.content = None
-		tool_request.tool_calls = [tool_call]
-		final_message = MagicMock()
-		final_message.content = "That time is available."
-		final_message.tool_calls = None
 		llm.client.chat.completions.create.side_effect = [
-			MagicMock(choices=[MagicMock(message=tool_request)]),
-			MagicMock(choices=[MagicMock(message=final_message)]),
+			FakeGroqStream([
+				groq_tool_call_chunk(
+					"call-123",
+					"check_doctor_availability",
+					arguments,
+				),
+			]),
+			FakeGroqStream([groq_content_chunk("That time is available.")]),
 		]
 		llm.check_doctor_availability = MagicMock(return_value={"available": True})
 

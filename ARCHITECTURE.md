@@ -314,7 +314,7 @@ class Transcript(models.Model):
   - **Output**: Joined text transcription string.
 - `get_stt_service(model_size="base.en", language="en") -> STTService`: Module-level singleton cache keyed by model and language.
 
-The English-only `base.en` model was compared locally with multilingual `base` on the supplied sample: mean transcription times were approximately 0.89 s vs. 0.91 s, and normalized transcripts were 98.7% similar. This single-sample measurement is not a general accuracy or latency guarantee. STT stays local by default; no audio is sent to Groq.
+The current default is the English-only `base.en` model. It was compared locally with multilingual `base` on one supplied sample: mean transcription times were approximately 0.89 s vs. 0.91 s, and normalized transcripts were 98.7% similar. This single-sample measurement is not a general accuracy or latency guarantee. STT stays local by default; no audio is sent to Groq.
 
 ---
 

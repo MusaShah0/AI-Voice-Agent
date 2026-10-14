@@ -23,7 +23,7 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │ 1. VAD Layer (Silero VAD on CPU)                             │
  │    • 512-sample (32ms) sliding evaluation                     │
  │    • 300ms pre-speech buffer                                  │
- │    • 500ms silence endpoint threshold                         │
+ │    • 700ms silence endpoint threshold                         │
  │    • User barge-in / interruption cancellation                │
  │                                                               │
  │ 2. STT Layer (Faster-Whisper "base.en" INT8 on CPU)           │
@@ -37,6 +37,9 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │    • Explicit bounded tool-calling loop:                       │
  │        - check_doctor_availability()                          │
  │        - book_appointment()                                   │
+ │        - list_upcoming_appointments()                         │
+ │        - reschedule_appointment()                             │
+ │        - cancel_appointment()                                 │
  │                                                               │
  │ 4. Scheduling & Persistence Layer                             │
  │    • Google Calendar API v3 (event creation)                  │
@@ -57,21 +60,37 @@ The system coordinates a real-time conversational voice loop connecting a React 
 ### Detailed Sequence of a Voice Turn
 0. **Connection Welcome**: After voice services initialize, the backend sends Janus’s welcome caption and synthesizes it with Piper. The browser displays the introduction and queues its PCM audio before handling user turns.
 1. **Audio Capture**: The browser requests a 16kHz `AudioContext` so browser-managed resampling is used when supported. At 16kHz it uses 512-sample frames, converts float32 samples directly to 16-bit signed PCM, and streams binary frames over WebSocket. If the requested context rate is unavailable, it falls back to the default context and existing client-side conversion. Browser noise suppression is disabled for the current accuracy comparison; echo cancellation and automatic gain control remain enabled.
+   - In parallel, the frontend uses the browser's `SpeechRecognition` / `webkitSpeechRecognition` API with interim results to show live captions while the user speaks. This does not add STT work to the Django backend or delay its audio pipeline. Browser support, recognition latency, and recognition service/privacy behavior depend on the browser.
 2. **Speech Detection (VAD)**: In `VoiceConsumer`, each chunk is evaluated by `Silero VAD`.
    - Per-connection buffering retains partial chunks until a complete 512-sample (1024-byte) window is available, avoiding discarded remainders without mixing audio between WebSocket sessions.
    - If silence precedes speech, a rolling 300ms pre-speech ring buffer retains starting consonants.
    - Once speech is detected, audio accumulates into `audio_buffer`.
-   - If the user speaks while the agent is playing an earlier response, the active turn task is immediately cancelled, and `{"status": "audio_stopped"}` is dispatched to cut off frontend audio playback.
-3. **Endpointing**: When `consecutive_silence_bytes` reaches 500ms (`SILENCE_THRESHOLD_BYTES = 16,000 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
+   - Once a turn has endpointed and backend processing begins, microphone audio frames are ignored until the turn response has finished playing. This prevents VAD false positives or speaker echo from cancelling STT/LLM work; the explicit stop-reply control remains available during playback.
+3. **Endpointing**: When `consecutive_silence_bytes` reaches 700ms (`SILENCE_THRESHOLD_BYTES = 22,400 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
 4. **Transcription (STT)**: The accumulated 16kHz mono PCM bytes are converted directly to a normalized float32 NumPy array and passed to `Faster-Whisper` (`compute_type="int8"`, `beam_size=1`, `vad_filter=False`, `condition_on_previous_text=False`, and English language hint by default). No temporary WAV file is written.
+   - If transcription returns no text, the backend sends a short spoken retry prompt and a final `agent_response` instead of ending silently; no empty user utterance is sent to the dialog model or saved as a transcript.
 5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.stream_dialog()`. Groq streams the final answer; any requested scheduling tools are executed before its spoken confirmation:
-   - Queries `check_doctor_availability(start_time, end_time)` against SQLite only; appointment writes are synced to Google Calendar when booking.
+   - Queries `check_doctor_availability(start_time, end_time)` against SQLite only; when only a start time is supplied the tool checks the default 30-minute window. Appointment writes are synced to Google Calendar when booking.
+   - During a booking availability check, the model also passes any known `caller_name` and `purpose` as optional structured tool arguments. The LLM service retains these with the resolved time in a per-WebSocket booking-context JSON object and reuses it in later tool requests, so only missing fields need to be asked; this uses the existing model call rather than adding a separate extraction request.
    - If a conflict exists, it informs the caller and suggests alternative slots.
    - Once the user confirms, it executes `book_appointment(caller_name, start_time, end_time, purpose)`.
+   - For an existing patient's schedule, `list_upcoming_appointments(caller_name)` returns up to ten future scheduled rows from SQLite, case-insensitively matched by name.
+   - `reschedule_appointment(caller_name, existing_start_time, new_start_time, new_end_time=None)` requires an unambiguous matching future appointment and rejects conflicts. An omitted `new_end_time` preserves the original duration; a provided end time is used as requested if it is later than the new start. Pending chart-review tasks are updated and the linked Google Calendar event is patched when authenticated.
+   - `cancel_appointment(caller_name, existing_start_time)` requires an unambiguous future appointment. It deletes the linked Google Calendar event when authenticated, marks the database appointment and pending tasks as cancelled, and refuses to change either when the required calendar event is missing or the calendar deletion fails.
+   - New appointments default to 30 minutes when no end time is provided. Explicitly requested durations are honored.
 6. **Speech Synthesis (TTS)**: As streamed text reaches sentence boundaries, `VoiceConsumer` synthesizes each sentence locally with Piper on a worker thread. A bounded queue lets Groq continue generating while Piper synthesizes the previous sentence.
 7. **Persistence**: The full turn (`User: ... | Agent: ...`) is saved to the `Transcript` table linked to the unique session ID.
 8. **Delivery**: Each synthesized sentence is sent as ordered, Base64-encoded mono PCM chunks; the final `agent_response` carries the complete caption and tool status.
-9. **Playback**: The frontend converts PCM samples into Web Audio buffers and schedules them consecutively as they arrive. Barge-in stops all queued audio for the interrupted turn.
+9. **Playback and captions**: The frontend converts PCM samples into Web Audio buffers and schedules them consecutively as they arrive. Interim browser captions appear while the user speaks; the completed turn uses the backend Faster-Whisper transcript. Barge-in stops all queued audio for the interrupted turn.
+
+### Doctor Dashboard and Appointment Reminders
+- The React route `/doc` is a separate doctor-facing dashboard with **Upcoming** and **All appointments** tabs. The all-appointments view includes patient, start/end time, purpose, and status; the upcoming tab is limited to future `Scheduled` visits.
+- `GET /api/doc/dashboard/` returns dashboard data and an in-app alert list for appointments starting within 15 minutes. The page refreshes this data every 60 seconds.
+- This dashboard/API is intentionally enabled only while Django `DEBUG=True`, as requested for local development. `DEBUG` can be set through the environment; it defaults to `true` for the current development setup. The dashboard is not authenticated and must not be exposed to a network or deployed with `DEBUG=True`.
+- `send_appointment_reminders` is a Django management command intended to run once per minute. It emails the doctor's configured `Doctor.email` address for each scheduled appointment in the next 15 minutes that has no recorded reminder. A successful send writes `Appointment.reminder_sent_at`; rescheduling clears that marker so the updated time receives a reminder. Email includes patient name and appointment time only; visit purpose remains in the dashboard.
+- SMTP is configured through environment variables (load them from the local `.env`; do not commit credentials): `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, and `DEFAULT_FROM_EMAIL`. Update the singleton doctor's email in the database to the doctor's actual recipient address before using reminders.
+- In this Windows development setup, schedule `manage.py send_appointment_reminders` using Windows Task Scheduler: run it every 1 minute, with **If the task is already running: Do not start a new instance**. Set the program to the project's `.venv\Scripts\python.exe`, arguments to `manage.py send_appointment_reminders`, and **Start in** to the repository root. A missed task run can cause a reminder to be sent late or missed if the appointment has already started; check command output/logs for SMTP failures.
+- The reminder command uses the `Appointment.reminder_sent_at` marker to avoid repeat sends. If an appointment is rescheduled before its reminder, rescheduling clears this marker. Schedule the task only once per project/database and disable overlapping instances.
 
 ### Local Piper Voice Setup
 
@@ -208,12 +227,14 @@ class Appointment(models.Model):
     end_time = models.DateTimeField()
     purpose = models.TextField()
     status = models.CharField(max_length=50, default='Scheduled')
+    google_event_id = models.CharField(max_length=255, null=True, blank=True)
 ```
 - `doctor`: ForeignKey to `Doctor` (ID 1).
 - `caller_name`: Patient or caller full name.
 - `start_time` / `end_time`: Timezone-aware timestamps representing the clinic-local appointment window; Django stores instants in UTC.
 - `purpose`: Reason for visit or symptoms described by patient.
 - `status`: Default `"Scheduled"`. Can be `"Cancelled"`, `"Completed"`.
+- `google_event_id`: Optional ID of the clinic calendar event created for this appointment; used to patch its time when rescheduling.
 
 ### 3. `Task` Model
 Follow-up clinical tasks automatically created for the doctor upon booking.
@@ -251,8 +272,8 @@ class Transcript(models.Model):
 | `AUDIO_SAMPLE_RATE` | `16000` | Input audio sample frequency in Hz. |
 | `AUDIO_SAMPLE_WIDTH` | `2` | 16-bit audio = 2 bytes per sample. |
 | `BYTES_PER_MS` | `32` | 1 millisecond = (16000 * 2) / 1000 = 32 bytes. |
-| `SILENCE_THRESHOLD_MS` | `500` | Sustained silence duration required to trigger end of utterance. |
-| `SILENCE_THRESHOLD_BYTES`| `16000` | 500 ms * 32 bytes/ms. |
+| `SILENCE_THRESHOLD_MS` | `700` | Sustained silence duration required to trigger end of utterance. |
+| `SILENCE_THRESHOLD_BYTES`| `22400` | 700 ms * 32 bytes/ms. |
 | `PRE_SPEECH_BUFFER_BYTES`| `9600` | 300 ms lead-in ring buffer to prevent clipping starting consonants. |
 | `MIN_SPEECH_BYTES` | `8000` | 250 ms minimum audio required to reject mic pops/coughs. |
 | `MAX_SPEECH_BYTES` | `800000` | 25 seconds safety ceiling to force processing in noisy environments. |
@@ -304,16 +325,28 @@ The English-only `base.en` model was compared locally with multilingual `base` o
 - `__init__(self, calendar_service=None)`: Initializes the Groq client with `GROQ_API_KEY`.
 - `_get_system_instruction(self) -> str`: Dynamically embeds current date and time (`Monday, October 12, 2026 at...`) and instructs Janus on tool calling, concise voice responses, and medical receptionist persona.
 - `_parse_datetime(self, dt_str: str) -> datetime.datetime`: Parses ISO and common datetime strings; naive values are clinic-local (`Asia/Karachi`), while offset-aware values are converted to the clinic timezone.
-- `check_doctor_availability(self, start_time: str, end_time: str) -> Dict[str, Any]`:
+- `check_doctor_availability(self, start_time: str, end_time: Optional[str] = None) -> Dict[str, Any]`:
   - Queries SQLite only for conflicting `Appointment` records where `start_time < slot_end AND end_time > slot_start`; does not call Google Calendar.
+  - Defaults the checked window to 30 minutes from the requested start time.
   - Formats conflicts and available times in the clinic timezone.
   - Returns `{"available": bool, "conflicts": list, "message": str}`.
   - Updates `self.last_tool_status` to `"availability_checked"` or `"conflict_detected"`.
-- `book_appointment(self, caller_name: str, start_time: str, end_time: str, purpose: str) -> Dict[str, Any]`:
+- `book_appointment(self, caller_name: str, start_time: str, purpose: str, end_time: Optional[str] = None) -> Dict[str, Any]`:
   - Inserts event to Google Calendar if authenticated, using an explicit clinic-local UTC offset.
-  - Calls `DataRepository.create_appointment_sync()` to persist appointment to SQLite.
+  - Calls `DataRepository.create_appointment_sync()` to persist appointment and its Google event ID to SQLite.
   - Calls `DataRepository.create_task_sync()` to create doctor chart review task.
+  - Defaults to a 30-minute appointment unless an end time is explicitly requested.
   - Updates `self.last_tool_status` to `"calendar_booked"`.
+- `list_upcoming_appointments(self, caller_name: str) -> Dict[str, Any]`:
+  - Returns up to ten future `"Scheduled"` appointments with a case-insensitive exact patient-name match, ordered by start time.
+  - Returns date/time values in clinic-local time and asks the model to clarify when multiple appointments match.
+- `reschedule_appointment(self, caller_name: str, existing_start_time: str, new_start_time: str, new_end_time: Optional[str] = None) -> Dict[str, Any]`:
+  - Matches a future appointment by patient name and existing start minute; rejects missing or ambiguous matches and conflicting new slots.
+  - Preserves appointment duration unless a new end time is specified, updates pending chart-review task due times, and patches the corresponding Google Calendar event if authenticated.
+  - Updates the database only after the calendar succeeds; attempts to restore the old calendar time if the database update fails.
+- `cancel_appointment(self, caller_name: str, existing_start_time: str) -> Dict[str, Any]`:
+  - Matches one future `"Scheduled"` appointment by case-insensitive exact caller name and existing start minute; refuses missing or ambiguous matches.
+  - Deletes the saved Google Calendar event before marking the appointment and its pending tasks `"Cancelled"` in SQLite. If Calendar is authenticated but the appointment has no stored event ID, or Calendar deletion fails, it leaves the database unchanged and reports an error.
 - `_build_messages(self, conversation_history: list, user_input: str)`: Builds provider messages from prior turns and the current input.
 - `process_dialog(self, conversation_history: list, user_input: str) -> Tuple[str, Optional[str]]`: Calls the configured Groq model and runs at most five tool-call rounds, returning tool results to the model before the final response.
   - Appends turns to `conversation_history`.
@@ -356,6 +389,7 @@ The English-only `base.en` model was compared locally with multilingual `base` o
 - `pcm16FromFloat(input: Float32Array, inputSampleRate: number) -> ArrayBuffer`: Resamples browser microphone audio (typically 44.1kHz or 48kHz) down to 16,000 Hz 16-bit signed Linear PCM integers.
 - `connectSocket()`: Connects to `ws://localhost:8001/ws/voice/` with a 6-second timeout.
 - `startMicrophone()`: Requests `getUserMedia` (mono, echoCancellation, noiseSuppression), creates `ScriptProcessor(4096, 1, 1)`, and streams binary PCM chunks over WebSocket.
+- `startLiveCaptions()`: Starts browser speech recognition with interim results and updates the temporary live-caption display. If unavailable, the UI indicates that the final backend transcript will appear after processing.
 - `stopMicrophone(notifyBackend = true)`: Disconnects audio nodes, stops mic tracks, closes `AudioContext`, and notifies backend with `{"action": "stop_audio"}`.
 - `playReply(audioPayload: string)`: Decodes base64 string to a binary `Uint8Array`, creates a `Blob` of type `audio/mpeg`, and plays it via HTML5 `Audio`.
 - `interrupt()`: Instantly cuts off local audio playback and sends `stop_audio` over WebSocket.
@@ -384,6 +418,13 @@ pip install -r requirements.txt
 # Verify the Doctor singleton record (ID 1: Dr. Melvin) is seeded
 .\venv\Scripts\python.exe -c "import django, os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'voice_agent_project.settings'); django.setup(); from core.models import Doctor; doc, _ = Doctor.objects.get_or_create(id=Doctor.SINGLETON_ID, defaults={'name': 'Dr. Melvin', 'email': 'musa813705@gmail.com', 'timezone': 'Asia/Karachi'}); print(f'Doctor seeded: {doc.name} (ID: {doc.id})')"
 ```
+
+After configuring SMTP and setting the singleton doctor's actual email address, verify reminders manually before scheduling the Windows task:
+```powershell
+.\venv\Scripts\python.exe manage.py send_appointment_reminders
+```
+
+Run the patient-facing UI at `http://localhost:3000/`; the local doctor dashboard is at `http://localhost:3000/doc/`. The dashboard reads `http://localhost:8000/api/doc/dashboard/`. Set `VITE_API_BASE_URL` in the frontend environment if the Django API runs at a different host or port.
 
 ### 3. Optional: Google Calendar Interactive OAuth
 ```powershell
@@ -420,7 +461,7 @@ Open **`http://localhost:3000`** in Google Chrome or Microsoft Edge.
 
 - [x] **Microphone Capture**: Captures 1-channel audio, converts float32 to 16kHz PCM-16.
 - [x] **WebSocket Transport**: Binary PCM audio streams cleanly to `ws://127.0.0.1:8001/ws/voice/`.
-- [x] **VAD Endpointing**: 512-sample evaluation on CPU with 500ms silence detection.
+- [x] **VAD Endpointing**: 512-sample evaluation on CPU with 700ms silence detection.
 - [x] **Faster-Whisper STT**: Transcribes local English voice input directly from float32 PCM arrays with `base.en` and CPU INT8 inference.
 - [x] **LLM Tool Calling**: Groq's configured model executes free/busy checks and appointment bookings.
 - [x] **Database Persistence**: Appointments, tasks, and dialogue transcripts persist to SQLite.

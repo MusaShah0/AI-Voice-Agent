@@ -17,6 +17,7 @@ from core.services.calendar_service import GoogleCalendarService, CalendarAuthEr
 
 logger = logging.getLogger(__name__)
 CLINIC_TIMEZONE = ZoneInfo(settings.TIME_ZONE)
+DEFAULT_APPOINTMENT_DURATION = datetime.timedelta(minutes=30)
 
 
 def _log_tool_timing(tool_name):
@@ -51,7 +52,7 @@ class LLMService:
             "type": "function",
             "function": {
                 "name": "check_doctor_availability",
-                "description": "Check whether Dr. Melvin is available for a date and time.",
+                "description": "Check whether Dr. Melvin is available for a date and time. If the caller gives only a start time, check a 30-minute appointment window.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -63,8 +64,16 @@ class LLMService:
                             "type": "string",
                             "description": "Appointment end datetime in the clinic's local timezone (Asia/Karachi, UTC+05:00), ISO 8601 format including +05:00 offset.",
                         },
+                        "caller_name": {
+                            "type": "string",
+                            "description": "Patient name if already provided for this booking; omit if not yet known.",
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "Visit purpose if already provided for this booking; omit if not yet known.",
+                        },
                     },
-                    "required": ["start_time", "end_time"],
+                    "required": ["start_time"],
                     "additionalProperties": False,
                 },
             },
@@ -73,7 +82,7 @@ class LLMService:
             "type": "function",
             "function": {
                 "name": "book_appointment",
-                "description": "Book an appointment after the caller confirms the time, name, and purpose.",
+                "description": "Book a 30-minute appointment when the caller has requested a booking and the required name, start time, and purpose are known. If the caller explicitly requests a different end time or duration, pass that end time.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -94,7 +103,77 @@ class LLMService:
                             "description": "Reason for the appointment.",
                         },
                     },
-                    "required": ["caller_name", "start_time", "end_time", "purpose"],
+                    "required": ["start_time"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_upcoming_appointments",
+                "description": "Look up a caller's upcoming scheduled appointments by their name before discussing or rescheduling them.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {
+                            "type": "string",
+                            "description": "Patient name as provided by the caller.",
+                        },
+                    },
+                    "required": ["caller_name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reschedule_appointment",
+                "description": "Move one upcoming appointment after matching the caller's name and existing appointment start time against the database. If new_end_time is omitted, preserve the original duration; if the caller requests a specific end time, use it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {
+                            "type": "string",
+                            "description": "Patient name as provided by the caller.",
+                        },
+                        "existing_start_time": {
+                            "type": "string",
+                            "description": "Exact date and start time of the existing appointment in clinic-local time with +05:00 offset.",
+                        },
+                        "new_start_time": {
+                            "type": "string",
+                            "description": "Requested new start date and time in clinic local time with +05:00 offset.",
+                        },
+                        "new_end_time": {
+                            "type": "string",
+                            "description": "Optional explicitly requested new end date and time in clinic local time with +05:00 offset. Omit to preserve the original appointment duration.",
+                        },
+                    },
+                    "required": ["caller_name", "existing_start_time", "new_start_time"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "cancel_appointment",
+                "description": "Cancel a specific upcoming appointment after matching the caller's name and existing appointment start time against the database. Do not cancel if the match is missing or ambiguous.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {
+                            "type": "string",
+                            "description": "Patient name as provided by the caller.",
+                        },
+                        "existing_start_time": {
+                            "type": "string",
+                            "description": "Exact date and start time of the appointment to cancel in clinic-local time with +05:00 offset.",
+                        },
+                    },
+                    "required": ["caller_name", "existing_start_time"],
                     "additionalProperties": False,
                 },
             },
@@ -114,6 +193,7 @@ class LLMService:
 
         self.calendar_service = calendar_service or GoogleCalendarService()
         self.last_tool_status = None
+        self.booking_context: Dict[str, str] = {}
 
     def _get_system_instruction(self) -> str:
         now_dt = django_timezone.localtime(django_timezone.now(), CLINIC_TIMEZONE)
@@ -126,16 +206,50 @@ class LLMService:
             "back to the caller in that same clinic-local timezone. Never reinterpret a clinic-local time as UTC. "
             "Your duties:\n"
             "1. Help callers check Dr. Melvin's availability and book appointments.\n"
-            "2. When the caller asks about a specific date or time, call check_doctor_availability.\n"
-            "3. If the slot is available, confirm with the caller and request their name and visit purpose if not yet provided.\n"
+            "2. New appointments are 30 minutes by default. When the caller asks to book at a specific start time, "
+            "call check_doctor_availability for that window and include every booking detail already stated, especially "
+            "caller_name and purpose. If only a start time is given, check a 30-minute window; use a different duration "
+            "only if explicitly requested.\n"
+            "3. Keep supplied booking details from every caller turn. After availability is confirmed, book using the "
+            "details already supplied and ask only for required details that are still missing. Never ask again for "
+            "a name, purpose, date, or time the caller already provided. If only the name is missing, ask only for the name.\n"
             "4. If the slot has a conflict (is busy), politely explain the conflict and suggest the alternative open time.\n"
-            "5. Once the caller confirms their name, visit purpose, and preferred time slot, call book_appointment.\n"
-            "6. Always keep your verbal responses concise, warm, natural, and conversational for voice output.\n"
-            "7. After booking, say the appointment has been added to Dr. Melvin's clinic schedule. "
+            "5. When the caller has requested a booking and their name, visit purpose, and preferred time are known, call book_appointment without asking them to repeat or reconfirm supplied details.\n"
+            "6. When a caller asks to hear their upcoming schedule, ask for their name if it is missing, "
+            "then call list_upcoming_appointments before giving appointment details. If several appointments are returned, "
+            "read their dates and times and ask which appointment they mean when unclear. "
+            "For cancellation, ask for the caller's name or appointment date/time if either is missing. "
+            "When both are clear, call cancel_appointment directly; it verifies the patient and exact appointment "
+            "against the database, and refuses missing or ambiguous matches. Confirm cancellation only if its result "
+            "is cancelled.\n"
+            "For a reschedule, ask for the caller's name, the existing appointment date/time, or the new date/time if any "
+            "are missing. When all three are clear, call reschedule_appointment directly; that tool verifies the name and "
+            "existing appointment time in the database and rejects missing or ambiguous matches. This avoids an unnecessary "
+            "extra model/tool round trip. If the caller specifies both a new start and end time, pass new_end_time; otherwise "
+            "omit it and preserve the appointment's existing duration. "
+            "Do not claim the change succeeded unless that tool returns status updated.\n"
+            "7. Always keep your verbal responses concise, warm, natural, and conversational for voice output.\n"
+            "8. After booking, say the appointment has been added to Dr. Melvin's clinic schedule. "
             "The connected Google Calendar belongs to the clinic, not the caller. Never claim that the "
             "appointment was added to the caller's personal calendar unless a tool confirms that.\n"
-            "8. Never output markdown asterisks, bullet lists, or formatting symbols that would sound unnatural when read aloud."
+            "9. Never output markdown asterisks, bullet lists, or formatting symbols that would sound unnatural when read aloud."
         )
+
+    def _remember_booking_details(
+        self,
+        caller_name: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> None:
+        for key, value in (
+            ("caller_name", caller_name),
+            ("start_time", start_time),
+            ("end_time", end_time),
+            ("purpose", purpose),
+        ):
+            if isinstance(value, str) and value.strip():
+                self.booking_context[key] = value.strip()
 
     def _parse_datetime(self, dt_str: str) -> datetime.datetime:
         """Helper to parse varied date/time formats returned by LLM into a timezone-aware datetime."""
@@ -156,24 +270,43 @@ class LLMService:
                 except ValueError:
                     continue
             else:
-                dt = datetime.datetime.now() + datetime.timedelta(days=1)
+                raise ValueError(f"Unsupported date/time value: {dt_str!r}")
 
         if django_timezone.is_naive(dt):
             dt = dt.replace(tzinfo=CLINIC_TIMEZONE)
         return dt.astimezone(CLINIC_TIMEZONE)
 
     @_log_tool_timing("check_doctor_availability")
-    def check_doctor_availability(self, start_time: str, end_time: str) -> Dict[str, Any]:
+    def check_doctor_availability(
+        self,
+        start_time: str,
+        end_time: Optional[str] = None,
+        caller_name: Optional[str] = None,
+        purpose: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Checks whether Dr. Melvin is available or has a schedule conflict for a given time window.
 
         Args:
             start_time: Start date and time of the proposed slot (ISO format or YYYY-MM-DD HH:MM:SS)
-            end_time: End date and time of the proposed slot (ISO format or YYYY-MM-DD HH:MM:SS)
+            end_time: Optional end date/time; defaults to 30 minutes after start_time.
         """
         logger.info("Tool check_doctor_availability called")
         try:
             start_dt = self._parse_datetime(start_time)
-            end_dt = self._parse_datetime(end_time)
+            end_dt = (
+                self._parse_datetime(end_time)
+                if end_time
+                else start_dt + DEFAULT_APPOINTMENT_DURATION
+            )
+            if end_dt <= start_dt:
+                raise ValueError("Availability window end must be later than its start.")
+            self.booking_context.clear()
+            self._remember_booking_details(
+                caller_name=caller_name,
+                start_time=start_dt.isoformat(),
+                end_time=end_dt.isoformat(),
+                purpose=purpose,
+            )
         except Exception as parse_err:
             logger.warning("Error parsing availability query times: %s", parse_err)
             return {
@@ -198,7 +331,8 @@ class LLMService:
                         "Dr. Melvin is busy with an existing appointment from "
                         f"{django_timezone.localtime(conflict.start_time, CLINIC_TIMEZONE).strftime('%I:%M %p')} "
                         f"to {django_timezone.localtime(conflict.end_time, CLINIC_TIMEZONE).strftime('%I:%M %p')}."
-                    )
+                    ),
+                    "booking_details": dict(self.booking_context),
                 }
         except Exception as db_err:
             logger.exception("Database conflict check failed: %s", db_err)
@@ -213,10 +347,320 @@ class LLMService:
         return {
             "available": True,
             "conflicts": [],
+            "booking_details": dict(self.booking_context),
             "message": (
                 "Dr. Melvin is completely free between "
                 f"{start_dt.strftime('%I:%M %p')} and {end_dt.strftime('%I:%M %p')}."
             )
+        }
+
+    @_log_tool_timing("list_upcoming_appointments")
+    def list_upcoming_appointments(self, caller_name: str) -> Dict[str, Any]:
+        """Returns up to ten future scheduled appointments matching the patient's name."""
+        normalized_name = caller_name.strip()
+        if not normalized_name:
+            self.last_tool_status = "error"
+            return {"status": "error", "message": "A patient name is required."}
+
+        appointments = DataRepository.list_upcoming_appointments_sync(
+            normalized_name,
+            django_timezone.now(),
+        )
+        if not appointments:
+            self.last_tool_status = "appointments_not_found"
+            return {
+                "status": "not_found",
+                "appointments": [],
+                "message": "No upcoming scheduled appointments were found for that name.",
+            }
+
+        self.last_tool_status = "appointments_found"
+        return {
+            "status": "found",
+            "appointments": [
+                {
+                    "appointment_id": appointment["id"],
+                    "start_time": appointment["start_time"].astimezone(CLINIC_TIMEZONE).isoformat(),
+                    "end_time": appointment["end_time"].astimezone(CLINIC_TIMEZONE).isoformat(),
+                    "start_display": appointment["start_time"].astimezone(CLINIC_TIMEZONE).strftime(
+                        "%A, %B %d at %I:%M %p"
+                    ),
+                    "end_display": appointment["end_time"].astimezone(CLINIC_TIMEZONE).strftime(
+                        "%I:%M %p"
+                    ),
+                    "purpose": appointment["purpose"],
+                }
+                for appointment in appointments
+            ],
+            "message": f"Found {len(appointments)} upcoming scheduled appointment(s).",
+        }
+
+    @_log_tool_timing("reschedule_appointment")
+    def reschedule_appointment(
+        self,
+        caller_name: str,
+        existing_start_time: str,
+        new_start_time: str,
+        new_end_time: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Reschedules a uniquely matched future appointment and syncs Google Calendar."""
+        normalized_name = caller_name.strip()
+        if not normalized_name:
+            self.last_tool_status = "error"
+            return {"status": "error", "message": "A patient name is required."}
+
+        try:
+            old_start = self._parse_datetime(existing_start_time)
+            new_start = self._parse_datetime(new_start_time)
+            requested_end = self._parse_datetime(new_end_time) if new_end_time else None
+        except (TypeError, ValueError) as parse_err:
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": f"Could not understand the appointment date or time: {parse_err}",
+            }
+
+        now = django_timezone.now()
+        if new_start <= now:
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": "The new appointment time must be in the future.",
+            }
+
+        old_minute = old_start.replace(second=0, microsecond=0)
+        matches = list(Appointment.objects.filter(
+            caller_name__iexact=normalized_name,
+            status="Scheduled",
+            start_time__gte=max(old_minute, now),
+            start_time__lt=old_minute + datetime.timedelta(minutes=1),
+        ).order_by("pk")[:2])
+
+        if not matches:
+            self.last_tool_status = "appointment_not_found"
+            return {
+                "status": "not_found",
+                "message": (
+                    "No upcoming scheduled appointment matched that name and time. "
+                    "Please check the patient's schedule and clarify which appointment to move."
+                ),
+            }
+        if len(matches) > 1:
+            self.last_tool_status = "appointment_ambiguous"
+            return {
+                "status": "ambiguous",
+                "message": (
+                    "More than one appointment matched that name and time. "
+                    "Ask the caller to clarify which appointment they mean."
+                ),
+            }
+
+        appointment = matches[0]
+        duration = appointment.end_time - appointment.start_time
+        if duration <= datetime.timedelta(0):
+            self.last_tool_status = "error"
+            return {"status": "error", "message": "The existing appointment has an invalid duration."}
+
+        new_end = requested_end or new_start + duration
+        if new_end <= new_start:
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": "The new appointment end time must be later than its start time.",
+            }
+        if Appointment.objects.filter(
+            status="Scheduled",
+            start_time__lt=new_end,
+            end_time__gt=new_start,
+        ).exclude(pk=appointment.pk).exists():
+            self.last_tool_status = "conflict_detected"
+            return {
+                "status": "conflict",
+                "message": "That new time conflicts with another scheduled appointment.",
+            }
+
+        calendar_synced = False
+        if self.calendar_service.is_authenticated():
+            if not appointment.google_event_id:
+                self.last_tool_status = "error"
+                return {
+                    "status": "error",
+                    "message": (
+                        "This appointment has no linked clinic calendar event, so it was not changed. "
+                        "Please contact the clinic to reschedule it."
+                    ),
+                }
+            try:
+                self.calendar_service.update_event(
+                    event_id=appointment.google_event_id,
+                    start_time=new_start,
+                    end_time=new_end,
+                )
+                calendar_synced = True
+            except Exception:
+                logger.exception(
+                    "Google Calendar update failed appointment_id=%s",
+                    appointment.pk,
+                )
+                self.last_tool_status = "error"
+                return {
+                    "status": "error",
+                    "message": (
+                        "The clinic calendar could not be updated, so the appointment was not changed."
+                    ),
+                }
+
+        try:
+            update_result = DataRepository.update_appointment_sync(
+                appointment_id=appointment.pk,
+                start_time=new_start,
+                end_time=new_end,
+            )
+            if update_result["status"] == "conflict":
+                raise RuntimeError("The requested appointment time now conflicts with another appointment.")
+        except Exception:
+            if calendar_synced:
+                try:
+                    self.calendar_service.update_event(
+                        event_id=appointment.google_event_id,
+                        start_time=appointment.start_time,
+                        end_time=appointment.end_time,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Google Calendar rollback failed appointment_id=%s",
+                        appointment.pk,
+                    )
+                    self.last_tool_status = "error"
+                    return {
+                        "status": "error",
+                        "message": (
+                            "The clinic calendar changed, but the database update failed and the "
+                            "calendar rollback also failed. Please contact the clinic."
+                        ),
+                    }
+            logger.exception("Appointment database update failed appointment_id=%s", appointment.pk)
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": "The appointment could not be updated in the scheduling database.",
+            }
+
+        self.last_tool_status = "appointment_rescheduled"
+        return {
+            "status": "updated",
+            "appointment_id": appointment.pk,
+            "caller_name": appointment.caller_name,
+            "start_time": new_start.strftime("%A, %B %d at %I:%M %p"),
+            "end_time": new_end.strftime("%I:%M %p"),
+            "google_calendar_synced": calendar_synced,
+            "message": "The appointment was rescheduled successfully.",
+        }
+
+    @_log_tool_timing("cancel_appointment")
+    def cancel_appointment(
+        self,
+        caller_name: str,
+        existing_start_time: str,
+    ) -> Dict[str, Any]:
+        """Cancels a uniquely matched upcoming appointment in the DB and linked calendar."""
+        normalized_name = caller_name.strip()
+        if not normalized_name:
+            self.last_tool_status = "error"
+            return {"status": "error", "message": "A patient name is required."}
+
+        try:
+            old_start = self._parse_datetime(existing_start_time)
+        except (TypeError, ValueError) as parse_err:
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": f"Could not understand the appointment date or time: {parse_err}",
+            }
+
+        now = django_timezone.now()
+        old_minute = old_start.replace(second=0, microsecond=0)
+        matches = list(Appointment.objects.filter(
+            caller_name__iexact=normalized_name,
+            status="Scheduled",
+            start_time__gte=max(old_minute, now),
+            start_time__lt=old_minute + datetime.timedelta(minutes=1),
+        ).order_by("pk")[:2])
+
+        if not matches:
+            self.last_tool_status = "appointment_not_found"
+            return {
+                "status": "not_found",
+                "message": "No upcoming scheduled appointment matched that name and time.",
+            }
+        if len(matches) > 1:
+            self.last_tool_status = "appointment_ambiguous"
+            return {
+                "status": "ambiguous",
+                "message": "More than one appointment matched that name and time. Ask which one to cancel.",
+            }
+
+        appointment = matches[0]
+        calendar_synced = False
+        if self.calendar_service.is_authenticated():
+            if not appointment.google_event_id:
+                self.last_tool_status = "error"
+                return {
+                    "status": "error",
+                    "message": (
+                        "This appointment has no linked clinic calendar event, so it was not cancelled. "
+                        "Please contact the clinic."
+                    ),
+                }
+            try:
+                self.calendar_service.delete_event(event_id=appointment.google_event_id)
+                calendar_synced = True
+            except Exception:
+                logger.exception(
+                    "Google Calendar cancellation failed appointment_id=%s",
+                    appointment.pk,
+                )
+                self.last_tool_status = "error"
+                return {
+                    "status": "error",
+                    "message": "The clinic calendar could not cancel this event, so the appointment was not changed.",
+                }
+
+        try:
+            result = DataRepository.cancel_appointment_sync(appointment.pk)
+            if result["status"] != "cancelled":
+                raise RuntimeError("Appointment was not cancelled in the database.")
+        except Exception:
+            if calendar_synced:
+                logger.exception(
+                    "Appointment database cancellation failed after calendar event deletion appointment_id=%s",
+                    appointment.pk,
+                )
+                self.last_tool_status = "error"
+                return {
+                    "status": "error",
+                    "message": (
+                        "The clinic calendar event was deleted, but the database cancellation failed. "
+                        "Please contact the clinic to reconcile this appointment."
+                    ),
+                }
+            logger.exception("Appointment database cancellation failed appointment_id=%s", appointment.pk)
+            self.last_tool_status = "error"
+            return {
+                "status": "error",
+                "message": "The appointment could not be cancelled in the scheduling database.",
+            }
+
+        self.last_tool_status = "appointment_cancelled"
+        return {
+            "status": "cancelled",
+            "appointment_id": appointment.pk,
+            "caller_name": appointment.caller_name,
+            "start_time": appointment.start_time.astimezone(CLINIC_TIMEZONE).strftime(
+                "%A, %B %d at %I:%M %p"
+            ),
+            "google_calendar_synced": calendar_synced,
+            "message": "The appointment was cancelled.",
         }
 
     @_log_tool_timing("book_appointment")
@@ -224,21 +668,27 @@ class LLMService:
         self,
         caller_name: str,
         start_time: str,
-        end_time: str,
-        purpose: str
+        purpose: str,
+        end_time: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Books and confirms an appointment with Dr. Melvin in Google Calendar and the database.
 
         Args:
             caller_name: Full name of the caller/patient
             start_time: Start date and time of the confirmed appointment
-            end_time: End date and time of the confirmed appointment
+            end_time: Optional end date/time; defaults to 30 minutes after the start.
             purpose: Reason or symptoms for the appointment
         """
         logger.info("Tool book_appointment called")
         try:
             start_dt = self._parse_datetime(start_time)
-            end_dt = self._parse_datetime(end_time)
+            end_dt = (
+                self._parse_datetime(end_time)
+                if end_time
+                else start_dt + DEFAULT_APPOINTMENT_DURATION
+            )
+            if end_dt <= start_dt:
+                raise ValueError("Appointment end time must be later than its start time.")
         except Exception as parse_err:
             logger.warning("Error parsing appointment slot: %s", parse_err)
             return {
@@ -268,7 +718,8 @@ class LLMService:
                 caller_name=caller_name,
                 start_time=start_dt,
                 end_time=end_dt,
-                purpose=purpose
+                purpose=purpose,
+                google_event_id=google_event_id,
             )
 
             # 3. Create follow-up chart review task for Dr. Melvin
@@ -282,6 +733,7 @@ class LLMService:
                 logger.warning("Could not create preparation task: %s", task_err)
 
             self.last_tool_status = "calendar_booked"
+            self.booking_context.clear()
             return {
                 "status": "confirmed",
                 "appointment_id": appointment_id,
@@ -310,6 +762,16 @@ class LLMService:
                     messages.append({"role": role, "content": content})
             except Exception as parse_err:
                 logger.warning("Skipping malformed conversation-history turn: %s", parse_err)
+        if self.booking_context:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "The current booking request has these structured details already extracted "
+                    "from the caller's messages, encoded as JSON: "
+                    f"{json.dumps(self.booking_context, ensure_ascii=False)}. "
+                    "Reuse them. Do not ask the caller to repeat any field that is present."
+                ),
+            })
         messages.append({"role": "user", "content": user_input})
         return messages
 
@@ -345,6 +807,9 @@ class LLMService:
         tool_handlers = {
             "check_doctor_availability": self.check_doctor_availability,
             "book_appointment": self.book_appointment,
+            "list_upcoming_appointments": self.list_upcoming_appointments,
+            "reschedule_appointment": self.reschedule_appointment,
+            "cancel_appointment": self.cancel_appointment,
         }
 
         try:
@@ -445,7 +910,35 @@ class LLMService:
                             else:
                                 logger.info("Pipeline Groq: executing tool=%s", tool_name)
                                 try:
-                                    result = handler(**arguments)
+                                    if tool_name == "book_appointment":
+                                        arguments = {
+                                            **self.booking_context,
+                                            **arguments,
+                                        }
+                                        missing_fields = [
+                                            field
+                                            for field in (
+                                                "caller_name",
+                                                "start_time",
+                                                "purpose",
+                                            )
+                                            if not str(arguments.get(field, "")).strip()
+                                        ]
+                                        if missing_fields:
+                                            self.last_tool_status = "booking_details_required"
+                                            result = {
+                                                "status": "missing_details",
+                                                "missing_fields": missing_fields,
+                                                "message": (
+                                                    "Booking was not created. Ask only for these "
+                                                    "missing details: "
+                                                    + ", ".join(missing_fields)
+                                                ),
+                                            }
+                                        else:
+                                            result = handler(**arguments)
+                                    else:
+                                        result = handler(**arguments)
                                 except Exception as tool_err:
                                     logger.exception("Groq tool execution failed tool=%s", tool_name)
                                     result = {"status": "error", "message": str(tool_err)}

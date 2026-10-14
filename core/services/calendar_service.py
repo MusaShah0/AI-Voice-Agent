@@ -231,6 +231,40 @@ class GoogleCalendarService:
             "status": created_event.get('status')
         }
 
+    def update_event(
+        self,
+        event_id: str,
+        start_time: Any,
+        end_time: Any,
+        calendar_id: str = 'primary',
+    ) -> Dict[str, Any]:
+        """Updates the scheduled time of an existing clinic calendar event."""
+        event = self.get_service().events().patch(
+            calendarId=calendar_id,
+            eventId=event_id,
+            body={
+                "start": {"dateTime": self._to_rfc3339(start_time)},
+                "end": {"dateTime": self._to_rfc3339(end_time)},
+            },
+        ).execute()
+        return {
+            "id": event.get("id"),
+            "start": event.get("start", {}).get("dateTime"),
+            "end": event.get("end", {}).get("dateTime"),
+            "status": event.get("status"),
+        }
+
+    def delete_event(
+        self,
+        event_id: str,
+        calendar_id: str = 'primary',
+    ) -> None:
+        """Deletes a clinic calendar event by its stored event ID."""
+        self.get_service().events().delete(
+            calendarId=calendar_id,
+            eventId=event_id,
+        ).execute()
+
     def list_upcoming_events(
         self,
         max_results: int = 10,

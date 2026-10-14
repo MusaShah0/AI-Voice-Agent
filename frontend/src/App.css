@@ -276,6 +276,11 @@ h2 {
 .agent-label { margin-top: 17px; color: #b35441; }
 .agent-label span { background: var(--coral); }
 .turn p { margin-top: 6px; color: var(--ink); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.live-caption { margin: 0 0 22px 45px; padding: 13px 15px; border: 1px solid #dce7e1; border-left: 3px solid #5da97c; border-radius: 4px; background: #f7faf8; }
+.live-caption-label { color: #398c6b; }
+.live-caption-label span { background: #5da97c; animation: blink 1.2s infinite; }
+.live-caption p { margin-top: 7px; color: var(--ink); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.live-caption-note { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .tool-status { display: inline-flex; margin-top: 11px; padding: 5px 7px; border-radius: 3px; background: #f0f4f1; color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .tool-status.error { color: #a34032; background: #fff0ec; }
 .pending-line {
@@ -324,6 +329,7 @@ h2 {
   .transcript-panel { min-height: 380px; margin-top: 30px; padding: 24px 0 0; border-top: 1px solid var(--line); border-left: 0; }
   .turn-list { min-height: 250px; }
   .empty-state { min-height: 240px; }
+  .live-caption { margin-left: 0; }
   .page-footer { min-height: 54px; gap: 12px; font-size: 8px; letter-spacing: .4px; }
 }
 

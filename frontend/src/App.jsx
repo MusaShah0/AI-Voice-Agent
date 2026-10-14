@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import DoctorDashboard from './DoctorDashboard'
 import {
   AudioLines,
   CircleHelp,
@@ -19,6 +20,12 @@ const toolStatusLabels = {
   availability_checked: 'Availability checked',
   conflict_detected: 'That time is unavailable',
   calendar_booked: 'Appointment booked',
+  appointments_found: 'Upcoming appointments found',
+  appointments_not_found: 'No upcoming appointments found',
+  appointment_rescheduled: 'Appointment rescheduled',
+  appointment_cancelled: 'Appointment cancelled',
+  appointment_not_found: 'Appointment not found',
+  appointment_ambiguous: 'Appointment needs clarification',
 }
 
 function pcm16FromFloat(input, inputSampleRate) {
@@ -51,8 +58,8 @@ function pcm16AtTargetRateFromFloat(input) {
   return output.buffer
 }
 
-function App() {
-  const socketUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname || 'localhost'}:8001/ws/voice/`
+function PatientApp() {
+  const socketUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname || 'localhost'}:8000/ws/voice/`
   const [connectionState, setConnectionState] = useState('disconnected')
   const [isRecording, setIsRecording] = useState(false)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -60,14 +67,23 @@ function App() {
   const [draft, setDraft] = useState('')
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
+  const [liveCaption, setLiveCaption] = useState('')
+  const [liveCaptionSupported, setLiveCaptionSupported] = useState(() => Boolean(
+    window.SpeechRecognition || window.webkitSpeechRecognition,
+  ))
+  const [liveCaptionNotice, setLiveCaptionNotice] = useState('')
   const socketRef = useRef(null)
   const socketPromiseRef = useRef(null)
   const socketGenerationRef = useRef(0)
+  const inputSuppressedRef = useRef(false)
   const streamRef = useRef(null)
   const contextRef = useRef(null)
   const sourceRef = useRef(null)
   const processorRef = useRef(null)
   const recordingRef = useRef(false)
+  const captionRecognitionRef = useRef(null)
+  const captionRecognitionGenerationRef = useRef(0)
+  const finalizedCaptionRef = useRef('')
   const playbackContextRef = useRef(null)
   const playbackSourcesRef = useRef(new Set())
   const playbackTurnRef = useRef(null)
@@ -123,6 +139,7 @@ function App() {
       playbackNextTimeRef.current = 0
       playbackCompleteRef.current = false
       setIsPlaying(false)
+      inputSuppressedRef.current = false
     }
   }
 
@@ -206,8 +223,17 @@ function App() {
           agent: message.caption,
           toolStatus: message.tool_status,
         }))
+        finalizedCaptionRef.current = ''
+        setLiveCaption('')
       }
       setPending(false)
+      if (
+        latestAudioTurnRef.current !== message.turn_id
+        && playbackTurnRef.current === null
+        && playbackSourcesRef.current.size === 0
+      ) {
+        inputSuppressedRef.current = false
+      }
       setError('')
       playbackQueueRef.current = playbackQueueRef.current.then(() => {
         if (socketGeneration !== socketGenerationRef.current) return
@@ -228,9 +254,13 @@ function App() {
         .catch((playbackError) => {
           setError(playbackError.message || 'The reply audio could not be played.')
           stopPlayback()
+          inputSuppressedRef.current = false
         })
     } else if (message.type === 'error') {
       setPending(false)
+      inputSuppressedRef.current = false
+      finalizedCaptionRef.current = ''
+      setLiveCaption('')
       setError(message.message || 'The backend could not process that turn.')
     } else if (message.status === 'audio_stopped') {
       if (Number.isInteger(message.turn_id)) {
@@ -240,9 +270,11 @@ function App() {
         )
       }
       setPending(false)
+      inputSuppressedRef.current = false
       stopPlayback()
     } else if (message.type === 'processing') {
       setPending(true)
+      inputSuppressedRef.current = true
       setError('')
     }
   }
@@ -267,6 +299,7 @@ function App() {
 
     setConnectionState('connecting')
     setError('')
+    inputSuppressedRef.current = false
     const socketGeneration = ++socketGenerationRef.current
     cancelledAudioTurnRef.current = 0
     latestAudioTurnRef.current = null
@@ -300,6 +333,7 @@ function App() {
         }
         setConnectionState('disconnected')
         setPending(false)
+        inputSuppressedRef.current = false
         if (recordingRef.current) stopMicrophone(false)
         if (!opened) reject(new Error('Connection closed before the assistant was ready.'))
       }
@@ -313,6 +347,13 @@ function App() {
 
   const stopMicrophone = async (notifyBackend = true) => {
     recordingRef.current = false
+    if (captionRecognitionRef.current) {
+      try {
+        captionRecognitionRef.current.stop()
+      } catch {
+        setLiveCaptionNotice('Live captions stopped unexpectedly; the final transcript will appear after processing.')
+      }
+    }
     if (notifyBackend && socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ action: 'stop_audio' }))
     }
@@ -327,6 +368,83 @@ function App() {
     }
     contextRef.current = null
     setIsRecording(false)
+  }
+
+  const startLiveCaptions = () => {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!Recognition) return
+
+    const generation = ++captionRecognitionGenerationRef.current
+    if (captionRecognitionRef.current) {
+      try {
+        captionRecognitionRef.current.abort()
+      } catch {
+        setLiveCaptionNotice('The previous live caption session did not close cleanly.')
+      }
+    }
+    const recognition = new Recognition()
+    recognition.lang = 'en-US'
+    recognition.continuous = true
+    recognition.interimResults = true
+    finalizedCaptionRef.current = ''
+    setLiveCaption('')
+    setLiveCaptionNotice('')
+    captionRecognitionRef.current = recognition
+
+    recognition.onresult = (event) => {
+      if (
+        generation !== captionRecognitionGenerationRef.current
+        || captionRecognitionRef.current !== recognition
+      ) return
+
+      let interim = ''
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index]
+        const text = result[0].transcript.trim()
+        if (result.isFinal && text) {
+          finalizedCaptionRef.current = `${finalizedCaptionRef.current} ${text}`.trim()
+        } else if (text) {
+          interim = `${interim} ${text}`.trim()
+        }
+      }
+      setLiveCaption(`${finalizedCaptionRef.current} ${interim}`.trim())
+    }
+
+    recognition.onerror = (event) => {
+      if (
+        generation !== captionRecognitionGenerationRef.current
+        || captionRecognitionRef.current !== recognition
+      ) return
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        setLiveCaptionNotice('Live captions are unavailable; the final transcript will appear after processing.')
+        setLiveCaptionSupported(false)
+        captionRecognitionRef.current = null
+      }
+    }
+
+    recognition.onend = () => {
+      if (
+        generation !== captionRecognitionGenerationRef.current
+        || captionRecognitionRef.current !== recognition
+      ) return
+      if (recordingRef.current) {
+        try {
+          recognition.start()
+        } catch {
+          setLiveCaptionNotice('Live captions paused; the final transcript will appear after processing.')
+          captionRecognitionRef.current = null
+        }
+      } else {
+        captionRecognitionRef.current = null
+      }
+    }
+
+    try {
+      recognition.start()
+    } catch {
+      captionRecognitionRef.current = null
+      setLiveCaptionNotice('Live captions could not be started; the final transcript will appear after processing.')
+    }
   }
 
   const startMicrophone = async () => {
@@ -372,9 +490,14 @@ function App() {
       sourceRef.current = source
       processorRef.current = processor
       recordingRef.current = true
+      startLiveCaptions()
       processor.onaudioprocess = (audioEvent) => {
         const input = audioEvent.inputBuffer.getChannelData(0)
-        if (socket.readyState === WebSocket.OPEN && recordingRef.current) {
+        if (
+          socket.readyState === WebSocket.OPEN
+          && recordingRef.current
+          && !inputSuppressedRef.current
+        ) {
           const pcm = context.sampleRate === TARGET_SAMPLE_RATE
             ? pcm16AtTargetRateFromFloat(input)
             : pcm16FromFloat(input, context.sampleRate)
@@ -396,12 +519,16 @@ function App() {
 
   const disconnect = async () => {
     await stopMicrophone()
+    finalizedCaptionRef.current = ''
+    setLiveCaption('')
+    setLiveCaptionNotice('')
     socketGenerationRef.current += 1
     stopPlayback()
     if (socketRef.current && socketRef.current.readyState < WebSocket.CLOSING) {
       socketRef.current.close(1000, 'Session ended')
     }
     socketRef.current = null
+    inputSuppressedRef.current = false
     setConnectionState('disconnected')
   }
 
@@ -430,8 +557,10 @@ function App() {
       socket.send(JSON.stringify({ action: 'process_text_turn', text }))
       setDraft('')
       setPending(true)
+      inputSuppressedRef.current = true
       setError('')
     } catch (connectionError) {
+      inputSuppressedRef.current = false
       setConnectionState('disconnected')
       setError(connectionError.message || 'Could not send the text turn.')
     }
@@ -565,18 +694,35 @@ function App() {
             </div>
 
             <div className="turn-list" aria-live="polite">
-              {turns.length === 0 && !pending && (
+              {turns.length === 0 && !pending && !isRecording && !liveCaption && (
                 <div className="empty-state">
                   <div className="empty-icon"><AudioLines size={23} /></div>
                   <strong>We’re ready when you are</strong>
                   <span>Ask about appointment times or leave us a message.</span>
                 </div>
               )}
+              {(isRecording || liveCaption) && (
+                <article className="live-caption" role="status" aria-live="polite">
+                  <div className="speaker-label live-caption-label"><span /> LIVE CAPTION</div>
+                  <p>
+                    {liveCaption
+                      || (liveCaptionSupported
+                        ? 'Listening for your words…'
+                        : 'Live captions are not supported in this browser.')}
+                  </p>
+                  <span className="live-caption-note">
+                    {liveCaptionNotice
+                      || (liveCaptionSupported
+                        ? 'Interim browser transcription; the completed turn uses the server transcript.'
+                        : 'Your final transcript will appear after you finish speaking.')}
+                  </span>
+                </article>
+              )}
               {turns.map((turn, index) => (
-                <article className="turn" key={`${index}-${turn.user}`}>
+                <article className="turn" key={`${index}-${turn.user || turn.agent}`}>
                   <div className="turn-number">{String(index + 1).padStart(2, '0')}</div>
                   <div className="turn-content">
-                    {!turn.isWelcome && (
+                    {!turn.isWelcome && turn.user && (
                       <>
                         <div className="speaker-label user-label"><span /> YOU</div>
                         <p>{turn.user}</p>
@@ -615,6 +761,11 @@ function App() {
       </div>
     </div>
   )
+}
+
+function App() {
+  const route = window.location.pathname.replace(/\/+$/, '') || '/'
+  return route === '/doc' ? <DoctorDashboard /> : <PatientApp />
 }
 
 export default App

@@ -26,8 +26,8 @@ VAD_WINDOW_BYTES = 512 * AUDIO_SAMPLE_WIDTH
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
-SILENCE_THRESHOLD_MS = 500
-SILENCE_THRESHOLD_BYTES = SILENCE_THRESHOLD_MS * BYTES_PER_MS  # 16,000 bytes (500ms silence)
+SILENCE_THRESHOLD_MS = 700
+SILENCE_THRESHOLD_BYTES = SILENCE_THRESHOLD_MS * BYTES_PER_MS  # 22,400 bytes (700ms silence)
 PRE_SPEECH_BUFFER_BYTES = 300 * BYTES_PER_MS                    # ~9,600 bytes (~300ms lead-in)
 MIN_SPEECH_BYTES = 250 * BYTES_PER_MS                           # ~8,000 bytes (~250ms min utterance)
 MAX_SPEECH_BYTES = 25 * AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH  # ~800,000 bytes (~25s max safety ceiling)
@@ -36,6 +36,7 @@ WELCOME_TEXT = (
     "Hello, I’m Janus, Dr. Melvin’s appointment scheduler. "
     "I can help you check availability or schedule a visit. How may I help you today?"
 )
+NO_SPEECH_RESPONSE = "I didn’t catch that. Could you please repeat?"
 SENTENCE_BOUNDARY = re.compile(r'[.!?](?:["\')\]]*)\s+')
 SENTENCE_ABBREVIATIONS = {"dr.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "etc."}
 
@@ -64,6 +65,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.session_id = "session_" + str(self.channel_name)
         self.conversation_history = []
         self.active_task = None
+        self.response_audio_active = False
         self.turn_counter = 0
 
         # Audio buffering & speech state
@@ -163,6 +165,13 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data=None, bytes_data=None):
         if bytes_data is not None:
+            if (
+                self.active_task
+                and not self.active_task.done()
+                and not self.response_audio_active
+            ):
+                return
+
             aligned_len = len(bytes_data) - (len(bytes_data) % AUDIO_SAMPLE_WIDTH)
             if aligned_len <= 0:
                 return
@@ -191,12 +200,23 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 )
                 raise
             vad_elapsed = time.perf_counter() - vad_started_at
+            if (
+                self.active_task
+                and not self.active_task.done()
+                and not self.response_audio_active
+            ):
+                return
+
             if self.speech_detected or has_speech:
                 self.speech_vad_elapsed_seconds += vad_elapsed
 
             if has_speech:
-                # 1. Handle user interruption: cut off active TTS / processing task
-                if self.active_task and not self.active_task.done():
+                # Only cancel a turn while response audio is actively being sent.
+                if (
+                    self.active_task
+                    and not self.active_task.done()
+                    and self.response_audio_active
+                ):
                     logger.info("User interrupted active turn in session %s", self.session_id)
                     self.active_task.cancel()
                     self.active_task = None
@@ -451,7 +471,48 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         if user_text.strip():
             await self.run_dialog_and_respond(user_text)
         else:
-            logger.warning("Pipeline STT: no speech transcription produced session=%s", self.session_id)
+            logger.warning(
+                "Pipeline STT: no speech transcription produced session=%s audio_bytes=%s",
+                self.session_id,
+                len(audio_data),
+            )
+            await self._respond_to_unrecognized_audio()
+
+    async def _respond_to_unrecognized_audio(self):
+        self.turn_counter += 1
+        turn_id = self.turn_counter
+        audio_bytes, sample_rate = await asyncio.to_thread(
+            self.tts.synthesize,
+            NO_SPEECH_RESPONSE,
+        )
+        if not audio_bytes:
+            raise RuntimeError("Piper returned no audio for the speech retry prompt")
+        if len(audio_bytes) % AUDIO_SAMPLE_WIDTH:
+            raise ValueError("Piper retry prompt PCM output is not aligned to 16-bit samples")
+
+        self.response_audio_active = True
+        try:
+            for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
+                audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
+                await self.send(text_data=json.dumps({
+                    "type": "audio_chunk",
+                    "turn_id": turn_id,
+                    "sequence": sequence,
+                    "format": "pcm_s16le",
+                    "channels": 1,
+                    "sample_rate": sample_rate,
+                    "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
+                }))
+        finally:
+            self.response_audio_active = False
+
+        await self.send(text_data=json.dumps({
+            "type": "agent_response",
+            "turn_id": turn_id,
+            "user_transcription": "",
+            "caption": NO_SPEECH_RESPONSE,
+            "tool_status": None,
+        }))
 
     async def run_dialog_and_respond(self, user_text: str):
         dialog_started = time.perf_counter()
@@ -502,22 +563,26 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             if len(audio_bytes) % AUDIO_SAMPLE_WIDTH:
                 raise ValueError("Piper PCM output is not aligned to 16-bit samples")
 
-            for offset in range(0, len(audio_bytes), AUDIO_CHUNK_BYTES):
-                audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
-                if len(audio_chunk) % AUDIO_SAMPLE_WIDTH:
-                    audio_chunk = audio_chunk[:-1]
-                if not audio_chunk:
-                    continue
-                await self.send(text_data=json.dumps({
-                    "type": "audio_chunk",
-                    "turn_id": turn_id,
-                    "sequence": sequence,
-                    "format": "pcm_s16le",
-                    "channels": 1,
-                    "sample_rate": sample_rate,
-                    "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
-                }))
-                sequence += 1
+            self.response_audio_active = True
+            try:
+                for offset in range(0, len(audio_bytes), AUDIO_CHUNK_BYTES):
+                    audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
+                    if len(audio_chunk) % AUDIO_SAMPLE_WIDTH:
+                        audio_chunk = audio_chunk[:-1]
+                    if not audio_chunk:
+                        continue
+                    await self.send(text_data=json.dumps({
+                        "type": "audio_chunk",
+                        "turn_id": turn_id,
+                        "sequence": sequence,
+                        "format": "pcm_s16le",
+                        "channels": 1,
+                        "sample_rate": sample_rate,
+                        "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
+                    }))
+                    sequence += 1
+            finally:
+                self.response_audio_active = False
 
             logger.info(
                 "Pipeline TTS: sentence synthesized session=%s turn=%s audio_bytes=%s elapsed_ms=%.2f",

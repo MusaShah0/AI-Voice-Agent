@@ -24,6 +24,8 @@ class Appointment(models.Model):
     end_time = models.DateTimeField()
     purpose = models.TextField()
     status = models.CharField(max_length=50, default='Scheduled')
+    google_event_id = models.CharField(max_length=255, null=True, blank=True)
+    reminder_sent_at = models.DateTimeField(null=True, blank=True)
 
 class Task(models.Model):
     doctor = models.ForeignKey(Doctor, on_delete=models.CASCADE)

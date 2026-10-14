@@ -1,17 +1,24 @@
+import asyncio
 import base64
 import json
+from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
 from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
-from django.test import TransactionTestCase
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone as django_timezone
 
-from .models import Transcript
+from .models import Appointment, Doctor, Task, Transcript
+from .consumers import VoiceConsumer
 from .routing import websocket_urlpatterns
+from .services.calendar_service import GoogleCalendarService
 
 
 class FakeVADService:
@@ -192,10 +199,12 @@ class VoiceConsumerTests(TransactionTestCase):
 		try:
 			# Speech chunk (16,000 bytes = 0.5s speech)
 			speech_chunk = b"\x01\x00" * 8000
-			# Silence chunk (16,000 bytes = 0.5s silence, exactly the endpoint threshold)
+			# Five hundred milliseconds must not endpoint the utterance.
 			silence_chunk = b"\x00\x00" * 8000
 			await self.communicator.send_to(bytes_data=speech_chunk)
 			await self.communicator.send_to(bytes_data=silence_chunk)
+			self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 3200)
 
 			processing = await self.communicator.receive_json_from(timeout=3)
 			stream_messages = []
@@ -209,7 +218,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(processing["type"], "processing")
 			self.assertEqual(response["user_transcription"], "test transcription")
 			self.assertTrue(stream_messages)
-			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 16000))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 19200))
 		finally:
 			await self.communicator.disconnect()
 
@@ -234,6 +243,8 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(self.fake_vad.audio_lengths, [1024])
 
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 8000)
+			self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 3200)
 			processing = await self.communicator.receive_json_from(timeout=3)
 			while True:
 				message = await self.communicator.receive_json_from(timeout=3)
@@ -241,16 +252,141 @@ class VoiceConsumerTests(TransactionTestCase):
 					break
 
 			self.assertEqual(processing["type"], "processing")
-			self.assertEqual(self.fake_vad.call_count, 2)
+			self.assertEqual(self.fake_vad.call_count, 3)
 			self.assertTrue(all(length % 1024 == 0 for length in self.fake_vad.audio_lengths))
-			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 8512))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 11712))
 		finally:
 			await self.communicator.disconnect()
+
+	async def test_empty_transcription_returns_retry_prompt_and_finishes_turn(self):
+		await self.connect_communicator()
+		try:
+			with patch.object(FakeSTTService, "transcribe", return_value=""):
+				await self.communicator.send_to(bytes_data=b"\x01\x00" * 8000)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+
+				processing = await self.communicator.receive_json_from(timeout=3)
+				audio_message = await self.communicator.receive_json_from(timeout=3)
+				response = await self.communicator.receive_json_from(timeout=3)
+
+			self.assertEqual(processing["type"], "processing")
+			self.assertEqual(audio_message["type"], "audio_chunk")
+			self.assertEqual(response["type"], "agent_response")
+			self.assertEqual(response["user_transcription"], "")
+			self.assertEqual(
+				response["caption"],
+				"I didn’t catch that. Could you please repeat?",
+			)
+		finally:
+			await self.communicator.disconnect()
+
+	async def test_audio_does_not_cancel_turn_while_assistant_is_processing(self):
+		consumer = VoiceConsumer()
+		consumer.active_task = asyncio.create_task(asyncio.sleep(30))
+		consumer.response_audio_active = False
+		consumer.vad = self.fake_vad
+		try:
+			await consumer.receive(bytes_data=b"\x01\x00" * 512)
+
+			self.assertFalse(consumer.active_task.done())
+			self.assertEqual(self.fake_vad.call_count, 0)
+		finally:
+			consumer.active_task.cancel()
+			try:
+				await consumer.active_task
+			except asyncio.CancelledError:
+				pass
 
 
 
 from unittest.mock import MagicMock
 from core.services.calendar_service import GoogleCalendarService, CalendarAuthError
+
+
+class DoctorDashboardTests(TransactionTestCase):
+	def setUp(self):
+		self.doctor, _ = Doctor.objects.get_or_create(
+			pk=Doctor.SINGLETON_ID,
+			defaults={
+				"name": "Dr. Melvin",
+				"email": "doctor@example.test",
+				"timezone": "Asia/Karachi",
+			},
+		)
+		self.now = django_timezone.now()
+
+	def create_appointment(self, **overrides):
+		values = {
+			"doctor": self.doctor,
+			"caller_name": "Patient Example",
+			"start_time": self.now + timedelta(minutes=10),
+			"end_time": self.now + timedelta(minutes=40),
+			"purpose": "Routine checkup",
+			"status": "Scheduled",
+		}
+		values.update(overrides)
+		return Appointment.objects.create(**values)
+
+	@override_settings(DEBUG=True)
+	def test_doctor_dashboard_returns_upcoming_all_and_reminder_data(self):
+		due_soon = self.create_appointment()
+		self.create_appointment(
+			caller_name="Later Patient",
+			start_time=self.now + timedelta(hours=2),
+			end_time=self.now + timedelta(hours=2, minutes=30),
+		)
+		self.create_appointment(
+			caller_name="Cancelled Patient",
+			start_time=self.now + timedelta(minutes=5),
+			end_time=self.now + timedelta(minutes=35),
+			status="Cancelled",
+		)
+
+		response = self.client.get("/api/doc/dashboard/")
+
+		self.assertEqual(response.status_code, 200)
+		data = response.json()
+		self.assertEqual(len(data["upcoming"]), 2)
+		self.assertEqual(len(data["all_appointments"]), 3)
+		self.assertEqual([item["id"] for item in data["reminders"]], [due_soon.pk])
+		self.assertEqual(data["reminders"][0]["purpose"], "Routine checkup")
+		self.assertEqual(data["doctor"]["timezone"], self.doctor.timezone)
+
+	@override_settings(DEBUG=False)
+	def test_doctor_dashboard_is_not_available_outside_development(self):
+		response = self.client.get("/api/doc/dashboard/")
+
+		self.assertEqual(response.status_code, 404)
+
+	def test_reminder_command_emails_once_and_does_not_include_visit_purpose(self):
+		appointment = self.create_appointment()
+
+		with patch(
+			"core.management.commands.send_appointment_reminders.send_mail",
+			return_value=1,
+		) as send_mail:
+			call_command("send_appointment_reminders")
+			call_command("send_appointment_reminders")
+
+		self.assertEqual(send_mail.call_count, 1)
+		self.assertEqual(send_mail.call_args.kwargs["recipient_list"], [self.doctor.email])
+		self.assertIn("Patient Example", send_mail.call_args.kwargs["message"])
+		self.assertNotIn("Routine checkup", send_mail.call_args.kwargs["message"])
+		appointment.refresh_from_db()
+		self.assertIsNotNone(appointment.reminder_sent_at)
+
+	def test_failed_reminder_email_is_reported_and_can_be_retried(self):
+		appointment = self.create_appointment()
+
+		with patch(
+			"core.management.commands.send_appointment_reminders.send_mail",
+			side_effect=OSError("SMTP unavailable"),
+		):
+			with self.assertRaises(CommandError):
+				call_command("send_appointment_reminders")
+
+		appointment.refresh_from_db()
+		self.assertIsNone(appointment.reminder_sent_at)
 
 
 class GoogleCalendarServiceTests(TransactionTestCase):
@@ -395,6 +531,104 @@ class LLMServiceToolsTests(TransactionTestCase):
 
 		self.assertIn("Dr. Melvin's clinic schedule", instruction)
 		self.assertIn("Never claim that the appointment was added to the caller's personal calendar", instruction)
+		self.assertIn("30 minutes by default", instruction)
+		self.assertIn("pass new_end_time", instruction)
+		self.assertIn("ask only for required details that are still missing", instruction)
+		self.assertIn("caller_name and purpose", instruction)
+		self.assertIn("call cancel_appointment directly", instruction)
+
+	def test_scheduling_tool_schema_allows_default_duration_and_explicit_reschedule_end(self):
+		tools = {
+			tool["function"]["name"]: tool["function"]
+			for tool in LLMService.TOOL_DEFINITIONS
+		}
+
+		self.assertEqual(
+			tools["book_appointment"]["parameters"]["required"],
+			["start_time"],
+		)
+		self.assertEqual(
+			tools["check_doctor_availability"]["parameters"]["required"],
+			["start_time"],
+		)
+		self.assertIn(
+			"new_end_time",
+			tools["reschedule_appointment"]["parameters"]["properties"],
+		)
+		self.assertNotIn(
+			"new_end_time",
+			tools["reschedule_appointment"]["parameters"]["required"],
+		)
+		self.assertEqual(
+			tools["cancel_appointment"]["parameters"]["required"],
+			["caller_name", "existing_start_time"],
+		)
+
+	def test_booking_details_are_carried_as_json_and_reused_after_asking_only_for_name(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = False
+		llm = LLMService(calendar_service=mock_cal)
+		start_time = "2026-10-15T21:00:00+05:00"
+		llm.client = MagicMock()
+		llm.client.chat.completions.create.side_effect = [
+			FakeGroqStream([
+				groq_tool_call_chunk(
+					"availability-call",
+					"check_doctor_availability",
+					json.dumps({
+						"start_time": start_time,
+						"purpose": "Routine checkup",
+					}),
+				),
+			]),
+			FakeGroqStream([groq_content_chunk("What name should I put on the appointment?")]),
+			FakeGroqStream([
+				groq_tool_call_chunk(
+					"booking-call",
+					"book_appointment",
+					json.dumps({
+						"caller_name": "Mike Smith",
+						"start_time": start_time,
+					}),
+				),
+			]),
+			FakeGroqStream([groq_content_chunk("Your routine checkup is booked for 9:00 PM.")]),
+		]
+		history = []
+
+		first_reply, _ = llm.process_dialog(
+			history,
+			"I want to book an appointment at 9 PM today for a routine checkup.",
+		)
+
+		self.assertEqual(first_reply, "What name should I put on the appointment?")
+		self.assertEqual(
+			llm.booking_context["purpose"],
+			"Routine checkup",
+		)
+		self.assertEqual(
+			llm.booking_context["start_time"],
+			"2026-10-15T21:00:00+05:00",
+		)
+
+		second_reply, status = llm.process_dialog(history, "My name is Mike Smith.")
+
+		self.assertEqual(second_reply, "Your routine checkup is booked for 9:00 PM.")
+		self.assertEqual(status, "calendar_booked")
+		appointment = Appointment.objects.get(caller_name="Mike Smith")
+		self.assertEqual(appointment.purpose, "Routine checkup")
+		self.assertEqual(appointment.start_time, llm._parse_datetime(start_time))
+		self.assertEqual(appointment.end_time - appointment.start_time, timedelta(minutes=30))
+		self.assertEqual(llm.booking_context, {})
+
+		second_booking_request = llm.client.chat.completions.create.call_args_list[2].kwargs["messages"]
+		structured_context = next(
+			message["content"]
+			for message in second_booking_request
+			if message["role"] == "system"
+			and "structured details already extracted" in message["content"].lower()
+		)
+		self.assertIn('"purpose": "Routine checkup"', structured_context)
 
 	def test_check_doctor_availability_uses_database_only_and_clinic_timezone(self):
 		mock_cal = MagicMock()
@@ -467,6 +701,347 @@ class LLMServiceToolsTests(TransactionTestCase):
 		# Verify task created
 		task = Task.objects.get(appointment=app)
 		self.assertIn("John Doe", task.description)
+		self.assertEqual(app.google_event_id, "google-event-123")
+
+	def test_book_appointment_defaults_to_thirty_minutes(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = False
+		llm = LLMService(calendar_service=mock_cal)
+
+		result = llm.book_appointment(
+			caller_name="Mike Smith",
+			start_time="2026-10-16 23:00:00",
+			purpose="Checkup",
+		)
+
+		self.assertEqual(result["status"], "confirmed")
+		self.assertEqual(result["start_time"], "Friday, October 16 at 11:00 PM")
+		self.assertEqual(result["end_time"], "11:30 PM")
+		appointment = Appointment.objects.get(pk=result["appointment_id"])
+		self.assertEqual(
+			appointment.end_time - appointment.start_time,
+			timedelta(minutes=30),
+		)
+
+	def test_availability_defaults_to_thirty_minute_window(self):
+		llm = LLMService(calendar_service=MagicMock())
+		start_time = django_timezone.now() + timedelta(days=2)
+		start_time = start_time.replace(second=0, microsecond=0)
+
+		result = llm.check_doctor_availability(start_time.isoformat())
+
+		self.assertTrue(result["available"])
+		appointment_start = start_time + timedelta(minutes=20)
+		Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Other Patient",
+			start_time=appointment_start,
+			end_time=appointment_start + timedelta(minutes=10),
+			purpose="Conflict",
+		)
+		conflict_result = llm.check_doctor_availability(start_time.isoformat())
+		self.assertFalse(conflict_result["available"])
+
+	def test_list_upcoming_appointments_matches_name_and_only_scheduled_future_records(self):
+		llm = LLMService(calendar_service=MagicMock())
+		start_time = django_timezone.now() + timedelta(days=2)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=start_time,
+			end_time=start_time + timedelta(minutes=30),
+			purpose="Checkup",
+		)
+		Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=start_time + timedelta(days=1),
+			end_time=start_time + timedelta(days=1, minutes=30),
+			purpose="Cancelled visit",
+			status="Cancelled",
+		)
+
+		result = llm.list_upcoming_appointments(" mike smith ")
+
+		self.assertEqual(result["status"], "found")
+		self.assertEqual([item["appointment_id"] for item in result["appointments"]], [appointment.pk])
+		self.assertEqual(result["appointments"][0]["purpose"], "Checkup")
+		self.assertEqual(llm.last_tool_status, "appointments_found")
+
+	def test_reschedule_updates_database_calendar_and_pending_task(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		llm = LLMService(calendar_service=mock_cal)
+		old_start = django_timezone.now() + timedelta(days=2)
+		old_start = old_start.replace(second=0, microsecond=0)
+		old_end = old_start + timedelta(minutes=45)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=old_start,
+			end_time=old_end,
+			purpose="Checkup",
+			google_event_id="google-event-456",
+			reminder_sent_at=django_timezone.now(),
+		)
+		task = Task.objects.create(
+			doctor=self.doctor,
+			appointment=appointment,
+			description="Review chart",
+			due_time=old_start - timedelta(hours=1),
+		)
+		new_start = old_start + timedelta(days=3)
+		new_start = new_start.replace(hour=23, minute=0)
+		new_end = new_start + timedelta(hours=1)
+
+		result = llm.reschedule_appointment(
+			caller_name="mike smith",
+			existing_start_time=old_start.isoformat(),
+			new_start_time=new_start.isoformat(),
+			new_end_time=new_end.isoformat(),
+		)
+
+		appointment.refresh_from_db()
+		task.refresh_from_db()
+		self.assertEqual(result["status"], "updated")
+		self.assertEqual(llm.last_tool_status, "appointment_rescheduled")
+		self.assertEqual(appointment.start_time, new_start)
+		self.assertEqual(appointment.end_time, new_end)
+		self.assertIsNone(appointment.reminder_sent_at)
+		self.assertEqual(task.due_time, new_start - timedelta(hours=1))
+		mock_cal.update_event.assert_called_once_with(
+			event_id="google-event-456",
+			start_time=new_start,
+			end_time=new_end,
+		)
+
+	def test_reschedule_defaults_to_existing_duration_when_end_is_not_requested(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = False
+		llm = LLMService(calendar_service=mock_cal)
+		old_start = django_timezone.now() + timedelta(days=2)
+		old_start = old_start.replace(second=0, microsecond=0)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=old_start,
+			end_time=old_start + timedelta(minutes=45),
+			purpose="Checkup",
+		)
+		new_start = old_start + timedelta(days=1)
+
+		result = llm.reschedule_appointment(
+			caller_name="Mike Smith",
+			existing_start_time=old_start.isoformat(),
+			new_start_time=new_start.isoformat(),
+		)
+
+		appointment.refresh_from_db()
+		self.assertEqual(result["status"], "updated")
+		self.assertEqual(appointment.end_time, new_start + timedelta(minutes=45))
+
+	def test_reschedule_rejects_end_not_after_new_start(self):
+		mock_cal = MagicMock()
+		llm = LLMService(calendar_service=mock_cal)
+		old_start = django_timezone.now() + timedelta(days=2)
+		old_start = old_start.replace(second=0, microsecond=0)
+		Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=old_start,
+			end_time=old_start + timedelta(minutes=30),
+			purpose="Checkup",
+		)
+		new_start = old_start + timedelta(days=1)
+
+		result = llm.reschedule_appointment(
+			caller_name="Mike Smith",
+			existing_start_time=old_start.isoformat(),
+			new_start_time=new_start.isoformat(),
+			new_end_time=(new_start - timedelta(minutes=1)).isoformat(),
+		)
+
+		self.assertEqual(result["status"], "error")
+		self.assertEqual(llm.last_tool_status, "error")
+
+	def test_reschedule_rejects_conflict_without_updating_calendar_or_appointment(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		llm = LLMService(calendar_service=mock_cal)
+		old_start = django_timezone.now() + timedelta(days=2)
+		old_start = old_start.replace(second=0, microsecond=0)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=old_start,
+			end_time=old_start + timedelta(minutes=30),
+			purpose="Checkup",
+			google_event_id="google-event-456",
+		)
+		conflict_start = old_start + timedelta(days=1)
+		Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Other Patient",
+			start_time=conflict_start,
+			end_time=conflict_start + timedelta(minutes=30),
+			purpose="Existing visit",
+		)
+
+		result = llm.reschedule_appointment(
+			caller_name="Mike Smith",
+			existing_start_time=old_start.isoformat(),
+			new_start_time=conflict_start.isoformat(),
+		)
+
+		self.assertEqual(result["status"], "conflict")
+		self.assertEqual(llm.last_tool_status, "conflict_detected")
+		appointment.refresh_from_db()
+		self.assertEqual(appointment.start_time, old_start)
+		mock_cal.update_event.assert_not_called()
+
+	def test_reschedule_calendar_failure_does_not_update_database(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		mock_cal.update_event.side_effect = RuntimeError("Calendar unavailable")
+		llm = LLMService(calendar_service=mock_cal)
+		old_start = django_timezone.now() + timedelta(days=2)
+		old_start = old_start.replace(second=0, microsecond=0)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=old_start,
+			end_time=old_start + timedelta(minutes=30),
+			purpose="Checkup",
+			google_event_id="google-event-456",
+		)
+
+		result = llm.reschedule_appointment(
+			caller_name="Mike Smith",
+			existing_start_time=old_start.isoformat(),
+			new_start_time=(old_start + timedelta(days=1)).isoformat(),
+		)
+
+		self.assertEqual(result["status"], "error")
+		self.assertEqual(llm.last_tool_status, "error")
+		appointment.refresh_from_db()
+		self.assertEqual(appointment.start_time, old_start)
+
+	def test_calendar_update_patches_only_event_start_and_end(self):
+		mock_resource = MagicMock()
+		mock_resource.events.return_value.patch.return_value.execute.return_value = {
+			"id": "google-event-456",
+			"start": {"dateTime": "2026-10-20T15:00:00+05:00"},
+			"end": {"dateTime": "2026-10-20T15:30:00+05:00"},
+			"status": "confirmed",
+		}
+		calendar = GoogleCalendarService()
+		calendar.get_service = MagicMock(return_value=mock_resource)
+		start_time = LLMService()._parse_datetime("2026-10-20 15:00")
+		end_time = start_time + timedelta(minutes=30)
+
+		result = calendar.update_event("google-event-456", start_time, end_time)
+
+		self.assertEqual(result["id"], "google-event-456")
+		mock_resource.events.return_value.patch.assert_called_once_with(
+			calendarId="primary",
+			eventId="google-event-456",
+			body={
+				"start": {"dateTime": start_time.isoformat()},
+				"end": {"dateTime": end_time.isoformat()},
+			},
+		)
+
+	def test_cancel_appointment_cancels_database_calendar_and_pending_tasks(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		llm = LLMService(calendar_service=mock_cal)
+		start_time = django_timezone.now() + timedelta(days=2)
+		start_time = start_time.replace(second=0, microsecond=0)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=start_time,
+			end_time=start_time + timedelta(minutes=30),
+			purpose="Checkup",
+			google_event_id="google-event-cancel-1",
+		)
+		task = Task.objects.create(
+			doctor=self.doctor,
+			appointment=appointment,
+			description="Review chart",
+			due_time=start_time - timedelta(hours=1),
+		)
+
+		result = llm.cancel_appointment("mike smith", start_time.isoformat())
+
+		appointment.refresh_from_db()
+		task.refresh_from_db()
+		self.assertEqual(result["status"], "cancelled")
+		self.assertEqual(llm.last_tool_status, "appointment_cancelled")
+		self.assertEqual(appointment.status, "Cancelled")
+		self.assertEqual(task.status, "Cancelled")
+		mock_cal.delete_event.assert_called_once_with(event_id="google-event-cancel-1")
+
+	def test_cancel_appointment_calendar_failure_keeps_database_scheduled(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		mock_cal.delete_event.side_effect = RuntimeError("Calendar unavailable")
+		llm = LLMService(calendar_service=mock_cal)
+		start_time = django_timezone.now() + timedelta(days=2)
+		start_time = start_time.replace(second=0, microsecond=0)
+		appointment = Appointment.objects.create(
+			doctor=self.doctor,
+			caller_name="Mike Smith",
+			start_time=start_time,
+			end_time=start_time + timedelta(minutes=30),
+			purpose="Checkup",
+			google_event_id="google-event-cancel-2",
+		)
+
+		result = llm.cancel_appointment("Mike Smith", start_time.isoformat())
+
+		appointment.refresh_from_db()
+		self.assertEqual(result["status"], "error")
+		self.assertEqual(appointment.status, "Scheduled")
+
+	def test_cancel_appointment_requires_unique_name_and_start_time_match(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		llm = LLMService(calendar_service=mock_cal)
+		start_time = django_timezone.now() + timedelta(days=2)
+		start_time = start_time.replace(second=0, microsecond=0)
+		appointments = [
+			Appointment.objects.create(
+				doctor=self.doctor,
+				caller_name="Mike Smith",
+				start_time=start_time,
+				end_time=start_time + timedelta(minutes=30),
+				purpose=f"Visit {index}",
+				google_event_id=f"google-event-cancel-{index}",
+			)
+			for index in range(2)
+		]
+
+		result = llm.cancel_appointment("Mike Smith", start_time.isoformat())
+
+		self.assertEqual(result["status"], "ambiguous")
+		self.assertEqual(llm.last_tool_status, "appointment_ambiguous")
+		for appointment in appointments:
+			appointment.refresh_from_db()
+			self.assertEqual(appointment.status, "Scheduled")
+		mock_cal.delete_event.assert_not_called()
+
+	def test_calendar_delete_uses_the_saved_event_id(self):
+		mock_resource = MagicMock()
+		calendar = GoogleCalendarService()
+		calendar.get_service = MagicMock(return_value=mock_resource)
+
+		calendar.delete_event("google-event-cancel-3")
+
+		mock_resource.events.return_value.delete.assert_called_once_with(
+			calendarId="primary",
+			eventId="google-event-cancel-3",
+		)
 
 	def test_process_dialog_fallback_on_error(self):
 		llm = LLMService()
@@ -543,7 +1118,13 @@ class LLMServiceToolsTests(TransactionTestCase):
 				tool["function"]["name"]
 				for tool in first_request["tools"]
 			],
-			["check_doctor_availability", "book_appointment"],
+			[
+				"check_doctor_availability",
+				"book_appointment",
+				"list_upcoming_appointments",
+				"reschedule_appointment",
+				"cancel_appointment",
+			],
 		)
 		self.assertEqual(second_request_messages[-1]["role"], "tool")
 		self.assertEqual(second_request_messages[-1]["tool_call_id"], "call-123")

@@ -10,6 +10,7 @@ import {
   Search,
   UserRound,
 } from 'lucide-react'
+import DoctorCallPanel from './DoctorCallPanel'
 import './DoctorDashboard.css'
 
 const API_URL = import.meta.env.VITE_API_BASE_URL || ''
@@ -68,6 +69,10 @@ function DoctorDashboard() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [lastUpdated, setLastUpdated] = useState(null)
+  const [activeReminders, setActiveReminders] = useState([])
+  const [activeCall, setActiveCall] = useState(null)
+  const [reminderError, setReminderError] = useState('')
+  const [startingCallFor, setStartingCallFor] = useState(null)
 
   const loadDashboard = useCallback(async (signal) => {
     try {
@@ -98,17 +103,97 @@ function DoctorDashboard() {
     }
   }, [])
 
+  const loadActiveReminders = useCallback(async (signal) => {
+    try {
+      const response = await fetch(`${API_URL}/api/doc/reminders/active/`, {
+        headers: { Accept: 'application/json' },
+        signal,
+      })
+      if (!response.ok) throw new Error(`Reminder refresh failed (${response.status}).`)
+      const data = await response.json()
+      setActiveReminders(data.active || [])
+      setReminderError('')
+    } catch (requestError) {
+      if (requestError.name !== 'AbortError') {
+        setReminderError(requestError.message || 'Could not refresh active reminders.')
+      }
+    }
+  }, [])
+
+  const startReminderCall = async (reminder) => {
+    setReminderError('')
+    setStartingCallFor(reminder.reminder_id)
+    let stream
+    let audioContext
+    let cancelled = false
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Microphone access requires localhost or a secure browser context.')
+      }
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext
+      if (!AudioContextClass) throw new Error('This browser does not support audio calls.')
+      audioContext = new AudioContextClass({ sampleRate: 16000 })
+      const resumePromise = audioContext.resume()
+      const streamPromise = navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: false,
+          autoGainControl: true,
+        },
+      }).then((acquiredStream) => {
+        if (cancelled) {
+          acquiredStream.getTracks().forEach((track) => track.stop())
+        } else {
+          stream = acquiredStream
+        }
+        return acquiredStream
+      })
+      const responsePromise = fetch(
+        `${API_URL}/api/doc/reminders/${reminder.reminder_id}/call-token/`,
+        { method: 'POST', headers: { Accept: 'application/json' } },
+      )
+      const [, , response] = await Promise.all([
+        resumePromise,
+        streamPromise,
+        responsePromise,
+      ])
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `Could not start call (${response.status}).`)
+      setActiveCall({
+        reminder,
+        ws_url: result.ws_url,
+        stream,
+        audioContext,
+      })
+      stream = null
+      audioContext = null
+    } catch (requestError) {
+      cancelled = true
+      stream?.getTracks().forEach((track) => track.stop())
+      if (audioContext && audioContext.state !== 'closed') await audioContext.close()
+      setReminderError(requestError.message || 'Could not start the reminder call.')
+    } finally {
+      setStartingCallFor(null)
+    }
+  }
+
   useEffect(() => {
     const controller = new AbortController()
     loadDashboard(controller.signal)
+    loadActiveReminders(controller.signal)
     const intervalId = window.setInterval(() => {
       loadDashboard()
     }, 60_000)
+    const reminderIntervalId = window.setInterval(() => {
+      loadActiveReminders()
+    }, 10_000)
     return () => {
       controller.abort()
       window.clearInterval(intervalId)
+      window.clearInterval(reminderIntervalId)
     }
-  }, [loadDashboard])
+  }, [loadDashboard, loadActiveReminders])
 
   const timeZone = dashboard?.doctor?.timezone || 'Asia/Karachi'
   const filteredAppointments = useMemo(() => {
@@ -166,25 +251,51 @@ function DoctorDashboard() {
             <div className="doctor-auto-refresh"><span /> AUTO-REFRESH · 60 SEC</div>
           </div>
 
-          {(dashboard?.reminders?.length > 0) && (
+          {activeReminders.length > 0 && (
             <section className="doctor-reminder" role="status" aria-live="polite">
               <div className="doctor-reminder-icon"><Bell size={19} /></div>
               <div>
                 <strong>
-                  {dashboard.reminders.length === 1
-                    ? 'Appointment starting within 15 minutes'
-                    : `${dashboard.reminders.length} appointments starting within 15 minutes`}
+                  {activeReminders.length === 1
+                    ? 'Appointment reminder'
+                    : `${activeReminders.length} active appointment reminders`}
                 </strong>
-                <p>
-                  {dashboard.reminders.map((appointment) => (
-                    <span key={appointment.id}>
-                      {appointment.patient_name} · {formatTime(appointment.start_time, timeZone)}
-                    </span>
+                <div className="doctor-reminder-list">
+                  {activeReminders.map((reminder) => (
+                    <div className="doctor-reminder-item" key={reminder.reminder_id}>
+                      <div>
+                        <p>
+                          <strong>{reminder.patient_name}</strong>
+                          {' · '}
+                          {formatTime(reminder.start_time, timeZone)}
+                          {' · '}
+                          {reminder.minutes_until_start <= 0
+                            ? 'starting now'
+                            : `${reminder.minutes_until_start} min`}
+                        </p>
+                        <span>
+                          Reminder active
+                          {reminder.status === 'snoozed' && reminder.next_fire_at
+                            ? ` · Snoozed until ${formatTime(reminder.next_fire_at, timeZone)}`
+                            : ` · Attempt ${reminder.attempt_count}`}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="doctor-reminder-call"
+                        disabled={Boolean(startingCallFor || activeCall)}
+                        onClick={() => startReminderCall(reminder)}
+                      >
+                        {startingCallFor === reminder.reminder_id ? 'Connecting…' : 'Call'}
+                      </button>
+                    </div>
                   ))}
-                </p>
+                </div>
               </div>
             </section>
           )}
+          {reminderError && <div className="doctor-error" role="alert"><CircleAlert size={17} /> {reminderError}</div>}
+          {activeCall && <DoctorCallPanel call={activeCall} onClose={() => setActiveCall(null)} />}
 
           <nav className="doctor-tabs" aria-label="Appointment views">
             <button

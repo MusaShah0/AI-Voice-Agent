@@ -132,6 +132,38 @@
 .doctor-reminder-icon { color: #a16d22; }
 .doctor-reminder strong { color: #6e4a18; font-size: 12px; }
 .doctor-reminder p { display: flex; flex-wrap: wrap; gap: 7px 16px; margin-top: 6px; color: #765c31; font-size: 11px; }
+.doctor-reminder-list { display: grid; gap: 11px; margin-top: 10px; }
+.doctor-reminder-item { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.doctor-reminder-item p { display: block; margin: 0; color: #765c31; }
+.doctor-reminder-item p strong { color: #6e4a18; }
+.doctor-reminder-item > div > span { display: block; margin-top: 4px; color: #8a7654; font-size: 10px; }
+.doctor-reminder-call, .doctor-call-start, .doctor-call-end {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid #477c5d;
+  border-radius: 4px;
+  background: #477c5d;
+  color: white;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.doctor-call-panel { margin-top: 15px; padding: 17px; border: 1px solid var(--line); border-radius: 5px; background: #fff; box-shadow: 0 8px 24px rgb(24 39 34 / 8%); }
+.doctor-call-panel > header { display: flex; justify-content: space-between; align-items: flex-start; }
+.doctor-call-panel > header h3 { margin: 6px 0 0; font-size: 16px; }
+.doctor-call-panel > header button { display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid var(--line); background: white; cursor: pointer; }
+.doctor-call-time { margin-top: 7px; color: var(--muted); font-size: 10px; }
+.doctor-call-caption { min-height: 42px; margin: 14px 0; padding: 12px; border-radius: 4px; background: #f4f7f4; color: var(--ink); font-size: 12px; line-height: 1.5; }
+.doctor-call-actions { display: flex; align-items: center; gap: 12px; }
+.doctor-call-status { color: var(--muted); font-size: 10px; }
+.doctor-call-listening { display: inline-flex; align-items: center; gap: 7px; color: #397653; font-size: 10px; font-weight: 700; }
+.doctor-call-end { margin-left: auto; border-color: #c75c48; background: #fff; color: #a04433; }
+.doctor-call-finished { margin-bottom: 12px; color: #397653; font-size: 11px; }
 
 .doctor-tabs {
   display: flex;

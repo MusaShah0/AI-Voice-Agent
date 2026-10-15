@@ -77,16 +77,20 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
-EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
-EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'true').lower() == 'true'
-DEFAULT_FROM_EMAIL = os.environ.get(
-    'DEFAULT_FROM_EMAIL',
-    EMAIL_HOST_USER or 'voice-agent@localhost',
+REMINDER_LEAD_MINUTES = int(os.environ.get('REMINDER_LEAD_MINUTES', '30'))
+REMINDER_REPEAT_MINUTES = int(os.environ.get('REMINDER_REPEAT_MINUTES', '5'))
+SNOOZE_MINUTES = int(os.environ.get('SNOOZE_MINUTES', '15'))
+SNOOZE_MIN_BUFFER_MINUTES = int(os.environ.get('SNOOZE_MIN_BUFFER_MINUTES', '1'))
+REMINDER_MAX_ATTEMPTS = int(os.environ.get('REMINDER_MAX_ATTEMPTS', '6'))
+REMINDER_MIN_LEAD_TO_REMIND_MINUTES = int(
+    os.environ.get('REMINDER_MIN_LEAD_TO_REMIND_MINUTES', '2')
 )
+DOCTOR_PRESENCE_TTL_SECONDS = int(os.environ.get('DOCTOR_PRESENCE_TTL_SECONDS', '30'))
+VOICE_INCLUDE_PURPOSE = os.environ.get('VOICE_INCLUDE_PURPOSE', 'true').lower() == 'true'
+CALL_AUTO_HANGUP_AFTER_TERMINAL = (
+    os.environ.get('CALL_AUTO_HANGUP_AFTER_TERMINAL', 'true').lower() == 'true'
+)
+DOCTOR_GROQ_MODEL = os.environ.get('DOCTOR_GROQ_MODEL', '').strip()
 
 LOGGING = {
     'version': 1,

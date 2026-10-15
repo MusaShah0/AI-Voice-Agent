@@ -61,8 +61,11 @@ def _resolve_tts():
 
 class VoiceConsumer(AsyncWebsocketConsumer):
     async def connect(self):
+        if not await self.authorize():
+            await self.close(code=4401)
+            return
         await self.accept()
-        self.session_id = "session_" + str(self.channel_name)
+        self.session_id = self.get_session_prefix() + str(self.channel_name)
         self.conversation_history = []
         self.active_task = None
         self.response_audio_active = False
@@ -106,7 +109,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            await self._send_welcome()
+            await self.on_ready()
         except Exception:
             logger.exception("Pipeline welcome failed session=%s", self.session_id)
             await self.send(text_data=json.dumps({
@@ -115,6 +118,15 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             }))
 
         logger.info("Pipeline ready: WebSocket connected session=%s", self.session_id)
+
+    async def authorize(self):
+        return True
+
+    def get_session_prefix(self):
+        return "session_"
+
+    async def on_ready(self):
+        await self._send_welcome()
 
     async def _send_welcome(self):
         self.turn_counter = 1

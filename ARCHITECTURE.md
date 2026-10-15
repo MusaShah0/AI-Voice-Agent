@@ -44,7 +44,7 @@ The system coordinates a real-time conversational voice loop connecting a React 
  │ 4. Scheduling & Persistence Layer                             │
  │    • Google Calendar API v3 (event creation)                  │
  │    • SQLite Database via Django ORM (Doctor, Appointment,     │
- │      Task, Transcript)                                        │
+ │      Reminder, ReminderEvent, Transcript)                     │
  │                                                               │
  │ 5. TTS Layer (local Piper "en_US-lessac-medium")              │
  │    • Groq final answer streams sentence by sentence           │
@@ -75,8 +75,8 @@ The system coordinates a real-time conversational voice loop connecting a React 
    - If a conflict exists, it informs the caller and suggests alternative slots.
    - Once the user confirms, it executes `book_appointment(caller_name, start_time, end_time, purpose)`.
    - For an existing patient's schedule, `list_upcoming_appointments(caller_name)` returns up to ten future scheduled rows from SQLite, case-insensitively matched by name.
-   - `reschedule_appointment(caller_name, existing_start_time, new_start_time, new_end_time=None)` requires an unambiguous matching future appointment and rejects conflicts. An omitted `new_end_time` preserves the original duration; a provided end time is used as requested if it is later than the new start. Pending chart-review tasks are updated and the linked Google Calendar event is patched when authenticated.
-   - `cancel_appointment(caller_name, existing_start_time)` requires an unambiguous future appointment. It deletes the linked Google Calendar event when authenticated, marks the database appointment and pending tasks as cancelled, and refuses to change either when the required calendar event is missing or the calendar deletion fails.
+   - `reschedule_appointment(caller_name, existing_start_time, new_start_time, new_end_time=None)` requires an unambiguous matching future appointment and rejects conflicts. An omitted `new_end_time` preserves the original duration; a provided end time is used as requested if it is later than the new start. The linked Google Calendar event is patched when authenticated.
+   - `cancel_appointment(caller_name, existing_start_time)` requires an unambiguous future appointment. It deletes the linked Google Calendar event when authenticated, marks the database appointment as cancelled, and refuses to change it when the required calendar event is missing or the calendar deletion fails.
    - New appointments default to 30 minutes when no end time is provided. Explicitly requested durations are honored.
 6. **Speech Synthesis (TTS)**: As streamed text reaches sentence boundaries, `VoiceConsumer` synthesizes each sentence locally with Piper on a worker thread. A bounded queue lets Groq continue generating while Piper synthesizes the previous sentence.
 7. **Persistence**: The full turn (`User: ... | Agent: ...`) is saved to the `Transcript` table linked to the unique session ID.
@@ -85,12 +85,12 @@ The system coordinates a real-time conversational voice loop connecting a React 
 
 ### Doctor Dashboard and Appointment Reminders
 - The React route `/doc` is a separate doctor-facing dashboard with **Upcoming** and **All appointments** tabs. The all-appointments view includes patient, start/end time, purpose, and status; the upcoming tab is limited to future `Scheduled` visits.
-- `GET /api/doc/dashboard/` returns dashboard data and an in-app alert list for appointments starting within 15 minutes. The page refreshes this data every 60 seconds.
-- This dashboard/API is intentionally enabled only while Django `DEBUG=True`, as requested for local development. `DEBUG` can be set through the environment; it defaults to `true` for the current development setup. The dashboard is not authenticated and must not be exposed to a network or deployed with `DEBUG=True`.
-- `send_appointment_reminders` is a Django management command intended to run once per minute. It emails the doctor's configured `Doctor.email` address for each scheduled appointment in the next 15 minutes that has no recorded reminder. A successful send writes `Appointment.reminder_sent_at`; rescheduling clears that marker so the updated time receives a reminder. Email includes patient name and appointment time only; visit purpose remains in the dashboard.
-- SMTP is configured through environment variables (load them from the local `.env`; do not commit credentials): `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, and `DEFAULT_FROM_EMAIL`. Update the singleton doctor's email in the database to the doctor's actual recipient address before using reminders.
-- In this Windows development setup, schedule `manage.py send_appointment_reminders` using Windows Task Scheduler: run it every 1 minute, with **If the task is already running: Do not start a new instance**. Set the program to the project's `.venv\Scripts\python.exe`, arguments to `manage.py send_appointment_reminders`, and **Start in** to the repository root. A missed task run can cause a reminder to be sent late or missed if the appointment has already started; check command output/logs for SMTP failures.
-- The reminder command uses the `Appointment.reminder_sent_at` marker to avoid repeat sends. If an appointment is rescheduled before its reminder, rescheduling clears this marker. Schedule the task only once per project/database and disable overlapping instances.
+- `GET /api/doc/dashboard/` returns the schedule. `GET /api/doc/reminders/active/` updates doctor-dashboard presence and returns active or snoozed reminders; the dashboard polls it every 10 seconds.
+- Chart-review preparation tasks are not currently part of booking or reminders. The legacy `Task` model/table is retained so existing rows are not deleted, but the dashboard and doctor call no longer read or modify those rows.
+- The in-app reminder engine creates a reminder for each appointment booked at least two minutes ahead. It first activates 30 minutes before the appointment and repeats every five minutes, up to six attempts. Snoozing defaults to 15 minutes, but the doctor can ask for another whole-minute duration; the requested time must leave at least one minute before the appointment. Snoozing changes only the reminder's `next_fire_at`, never the appointment. Acknowledge, cancellation, rescheduling, and appointment start update or stop the reminder.
+- Start the scheduler in a separate terminal with `manage.py run_reminder_scheduler`. Use `--once` for a single sweep. The old `send_appointment_reminders` command remains a compatibility alias for one in-app sweep and no longer sends email. Disable any old Windows Task Scheduler email command entries; configure at most one looping scheduler per database.
+- Clicking **Call** requests a short-lived signed token at `POST /api/doc/reminders/<id>/call-token/` and opens `/ws/doc-voice/`. The token identifies the reminder; the WebSocket consumer validates it and loads that reminder's linked appointment and doctor through `ReminderService.get_call_context()`. The initial appointment-specific greeting is built by the consumer and spoken with local Piper TTS; it is not an LLM-generated greeting. For each user turn, common actions such as acknowledge and snooze are handled directly in code. Other utterances are sent to the doctor LLM with a system prompt containing the bound appointment's patient name, start time, purpose, reminder status, current time, and clinic timezone. The LLM can respond conversationally or request one of the explicitly offered tools; Django validates availability and handles all database actions. Rescheduling is only proposed first and changes the appointment after the doctor confirms in a later turn. The doctor agent is separate from the patient voice agent.
+- The doctor dashboard, reminder APIs, and doctor voice call are intentionally available only while Django `DEBUG=True`. They are unauthenticated local-development features and must not be exposed to a network or deployed with `DEBUG=True`; real doctor authentication is required first.
 
 ### Local Piper Voice Setup
 
@@ -236,19 +236,7 @@ class Appointment(models.Model):
 - `status`: Default `"Scheduled"`. Can be `"Cancelled"`, `"Completed"`.
 - `google_event_id`: Optional ID of the clinic calendar event created for this appointment; used to patch its time when rescheduling.
 
-### 3. `Task` Model
-Follow-up clinical tasks automatically created for the doctor upon booking.
-```python
-class Task(models.Model):
-    doctor = models.ForeignKey(Doctor, on_delete=models.CASCADE)
-    appointment = models.ForeignKey(Appointment, on_delete=models.SET_NULL, null=True)
-    description = models.TextField()
-    due_time = models.DateTimeField()
-    status = models.CharField(max_length=20, default='Pending')
-```
-- Automatically scheduled by `DataRepository.create_task_sync()` for 1 hour prior to appointment start time (e.g. *"Review medical chart for appointment with Alice Johnson"*).
-
-### 4. `Transcript` Model
+### 3. `Transcript` Model
 Audit trail of dialogue turns for all sessions.
 ```python
 class Transcript(models.Model):
@@ -334,7 +322,6 @@ The current default is the English-only `base.en` model. It was compared locally
 - `book_appointment(self, caller_name: str, start_time: str, purpose: str, end_time: Optional[str] = None) -> Dict[str, Any]`:
   - Inserts event to Google Calendar if authenticated, using an explicit clinic-local UTC offset.
   - Calls `DataRepository.create_appointment_sync()` to persist appointment and its Google event ID to SQLite.
-  - Calls `DataRepository.create_task_sync()` to create doctor chart review task.
   - Defaults to a 30-minute appointment unless an end time is explicitly requested.
   - Updates `self.last_tool_status` to `"calendar_booked"`.
 - `list_upcoming_appointments(self, caller_name: str) -> Dict[str, Any]`:
@@ -342,11 +329,11 @@ The current default is the English-only `base.en` model. It was compared locally
   - Returns date/time values in clinic-local time and asks the model to clarify when multiple appointments match.
 - `reschedule_appointment(self, caller_name: str, existing_start_time: str, new_start_time: str, new_end_time: Optional[str] = None) -> Dict[str, Any]`:
   - Matches a future appointment by patient name and existing start minute; rejects missing or ambiguous matches and conflicting new slots.
-  - Preserves appointment duration unless a new end time is specified, updates pending chart-review task due times, and patches the corresponding Google Calendar event if authenticated.
+  - Preserves appointment duration unless a new end time is specified and patches the corresponding Google Calendar event if authenticated.
   - Updates the database only after the calendar succeeds; attempts to restore the old calendar time if the database update fails.
 - `cancel_appointment(self, caller_name: str, existing_start_time: str) -> Dict[str, Any]`:
   - Matches one future `"Scheduled"` appointment by case-insensitive exact caller name and existing start minute; refuses missing or ambiguous matches.
-  - Deletes the saved Google Calendar event before marking the appointment and its pending tasks `"Cancelled"` in SQLite. If Calendar is authenticated but the appointment has no stored event ID, or Calendar deletion fails, it leaves the database unchanged and reports an error.
+  - Deletes the saved Google Calendar event before marking the appointment `"Cancelled"` in SQLite. If Calendar is authenticated but the appointment has no stored event ID, or Calendar deletion fails, it leaves the database unchanged and reports an error.
 - `_build_messages(self, conversation_history: list, user_input: str)`: Builds provider messages from prior turns and the current input.
 - `process_dialog(self, conversation_history: list, user_input: str) -> Tuple[str, Optional[str]]`: Calls the configured Groq model and runs at most five tool-call rounds, returning tool results to the model before the final response.
   - Appends turns to `conversation_history`.
@@ -379,8 +366,6 @@ The current default is the English-only `base.en` model. It was compared locally
 
 - `save_transcript(session_id: str, full_transcript: str) -> Transcript`: Persists conversational turns to `Transcript`.
 - `create_appointment_sync(caller_name: str, start_time, end_time, purpose: str) -> int`: Persists confirmed appointment linked to `Doctor` singleton ID 1 and returns the new appointment ID.
-- `create_task_sync(appointment_id: int, description: str, due_time) -> int`: Persists preparation task linked to the appointment and returns task ID.
-
 ---
 
 ### `frontend/src/App.jsx`
@@ -419,9 +404,9 @@ pip install -r requirements.txt
 .\venv\Scripts\python.exe -c "import django, os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'voice_agent_project.settings'); django.setup(); from core.models import Doctor; doc, _ = Doctor.objects.get_or_create(id=Doctor.SINGLETON_ID, defaults={'name': 'Dr. Melvin', 'email': 'musa813705@gmail.com', 'timezone': 'Asia/Karachi'}); print(f'Doctor seeded: {doc.name} (ID: {doc.id})')"
 ```
 
-After configuring SMTP and setting the singleton doctor's actual email address, verify reminders manually before scheduling the Windows task:
+Run a one-time reminder sweep to test the in-app reminder engine:
 ```powershell
-.\venv\Scripts\python.exe manage.py send_appointment_reminders
+.\venv\Scripts\python.exe manage.py run_reminder_scheduler --once
 ```
 
 Run the patient-facing UI at `http://localhost:3000/`; the local doctor dashboard is at `http://localhost:3000/doc/`. The dashboard reads `http://localhost:8000/api/doc/dashboard/`. Set `VITE_API_BASE_URL` in the frontend environment if the Django API runs at a different host or port.

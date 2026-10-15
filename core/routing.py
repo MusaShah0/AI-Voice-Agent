@@ -1,6 +1,7 @@
 from django.urls import re_path
-from . import consumers
+from . import consumers, doc_consumers
 
 websocket_urlpatterns = [
     re_path(r'ws/voice/$', consumers.VoiceConsumer.as_asgi()),
+    re_path(r'ws/doc-voice/$', doc_consumers.DoctorVoiceConsumer.as_asgi()),
 ]

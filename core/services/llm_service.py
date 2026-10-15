@@ -722,16 +722,6 @@ class LLMService:
                 google_event_id=google_event_id,
             )
 
-            # 3. Create follow-up chart review task for Dr. Melvin
-            try:
-                DataRepository.create_task_sync(
-                    appointment_id=appointment_id,
-                    description=f"Review medical chart for appointment with {caller_name} ({purpose})",
-                    due_time=start_dt - datetime.timedelta(hours=1)
-                )
-            except Exception as task_err:
-                logger.warning("Could not create preparation task: %s", task_err)
-
             self.last_tool_status = "calendar_booked"
             self.booking_context.clear()
             return {

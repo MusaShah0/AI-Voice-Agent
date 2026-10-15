@@ -1,8 +1,6 @@
-from datetime import timedelta
-
 from django.db import transaction
 
-from .models import Appointment, Task, Transcript, Doctor
+from .models import Appointment, Transcript, Doctor
 
 
 class DataRepository:
@@ -38,16 +36,20 @@ class DataRepository:
         purpose,
         google_event_id=None,
     ):
-        doctor = Doctor.objects.get(pk=Doctor.SINGLETON_ID)
-        appointment = Appointment.objects.create(
-            doctor=doctor,
-            caller_name=caller_name,
-            start_time=start_time,
-            end_time=end_time,
-            purpose=purpose,
-            google_event_id=google_event_id,
-        )
-        return appointment.id
+        with transaction.atomic():
+            doctor = Doctor.objects.get(pk=Doctor.SINGLETON_ID)
+            appointment = Appointment.objects.create(
+                doctor=doctor,
+                caller_name=caller_name,
+                start_time=start_time,
+                end_time=end_time,
+                purpose=purpose,
+                google_event_id=google_event_id,
+            )
+            from core.reminders.service import ReminderService
+
+            ReminderService.create_for_appointment(appointment)
+            return appointment.id
 
     @staticmethod
     def update_appointment_sync(appointment_id, start_time, end_time):
@@ -66,12 +68,10 @@ class DataRepository:
 
             appointment.start_time = start_time
             appointment.end_time = end_time
-            appointment.reminder_sent_at = None
-            appointment.save(update_fields=["start_time", "end_time", "reminder_sent_at"])
-            Task.objects.filter(
-                appointment=appointment,
-                status="Pending",
-            ).update(due_time=start_time - timedelta(hours=1))
+            appointment.save(update_fields=["start_time", "end_time"])
+            from core.reminders.service import ReminderService
+
+            ReminderService.reset_for_appointment(appointment.pk)
             return {"status": "updated"}
 
     @staticmethod
@@ -83,18 +83,7 @@ class DataRepository:
             )
             appointment.status = "Cancelled"
             appointment.save(update_fields=["status"])
-            Task.objects.filter(
-                appointment=appointment,
-                status="Pending",
-            ).update(status="Cancelled")
-            return {"status": "cancelled"}
+            from core.reminders.service import ReminderService
 
-    @staticmethod
-    def create_task_sync(appointment_id, description, due_time):
-        task = Task.objects.create(
-            doctor_id=Doctor.SINGLETON_ID,
-            appointment_id=appointment_id,
-            description=description,
-            due_time=due_time
-        )
-        return task.id
+            ReminderService.cancel_for_appointment(appointment.pk)
+            return {"status": "cancelled"}

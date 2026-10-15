@@ -11,13 +11,16 @@ from channels.db import database_sync_to_async
 from channels.routing import URLRouter
 from channels.testing import WebsocketCommunicator
 from django.core.management import call_command
-from django.core.management.base import CommandError
+from django.core import signing
 from django.test import TransactionTestCase, override_settings
 from django.utils import timezone as django_timezone
 
-from .models import Appointment, Doctor, Task, Transcript
+from .models import Appointment, Doctor, Reminder, ReminderEvent, Task, Transcript
 from .consumers import VoiceConsumer
 from .routing import websocket_urlpatterns
+from .reminders.policy import first_fire_at, snooze_decision
+from .reminders.service import ReminderService
+from .reminders.sweep import claim_and_fire
 from .services.calendar_service import GoogleCalendarService
 
 
@@ -194,6 +197,72 @@ class VoiceConsumerTests(TransactionTestCase):
 		finally:
 			await self.communicator.disconnect()
 
+	@override_settings(DEBUG=True)
+	async def test_doctor_reminder_call_snoozes_without_changing_appointment(self):
+		def create_reminder():
+			doctor, _ = Doctor.objects.get_or_create(
+				pk=Doctor.SINGLETON_ID,
+				defaults={
+					"name": "Dr. Melvin",
+					"email": "doctor@example.test",
+					"timezone": "Asia/Karachi",
+				},
+			)
+			start_time = django_timezone.now() + timedelta(hours=1)
+			appointment = Appointment.objects.create(
+				doctor=doctor,
+				caller_name="Patient Example",
+				start_time=start_time,
+				end_time=start_time + timedelta(minutes=30),
+				purpose="Routine checkup",
+			)
+			return ReminderService.create_for_appointment(appointment).pk, start_time
+
+		reminder_id, start_time = await database_sync_to_async(create_reminder)()
+		token = signing.TimestampSigner(salt="core.reminders.call").sign_object(
+			{"reminder_id": reminder_id}
+		)
+		communicator = WebsocketCommunicator(
+			URLRouter(websocket_urlpatterns),
+			f"/ws/doc-voice/?token={token}",
+		)
+		connected, denial = await communicator.connect()
+		self.assertTrue(connected, denial)
+		try:
+			ready = await communicator.receive_json_from(timeout=3)
+			self.assertEqual(ready["type"], "call_ready")
+			self.assertEqual(ready["patient_name"], "Patient Example")
+			while True:
+				message = await communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					self.assertTrue(message["is_welcome"])
+					self.assertNotIn("Dr. Dr.", message["caption"])
+					break
+
+			await communicator.send_to(text_data=json.dumps({
+				"action": "process_text_turn",
+				"text": "Could you please snooze it for 10 minutes?",
+			}))
+			self.assertEqual((await communicator.receive_json_from(timeout=3))["type"], "processing")
+			while True:
+				message = await communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					self.assertEqual(message["tool_status"], "reminder_snoozed")
+					break
+			ended = await communicator.receive_json_from(timeout=3)
+			self.assertEqual(ended, {"type": "call_ended", "reason": "reminder_snoozed"})
+			reminder = await database_sync_to_async(Reminder.objects.select_related("appointment").get)(
+				pk=reminder_id,
+			)
+			self.assertEqual(reminder.status, Reminder.Status.SNOOZED)
+			self.assertLess(
+				abs((reminder.next_fire_at - reminder.last_call_at - timedelta(minutes=10)).total_seconds()),
+				2,
+			)
+			self.assertEqual(reminder.appointment.start_time, start_time)
+		finally:
+			await communicator.disconnect()
+
 	async def test_binary_pcm_is_converted_to_float32_for_transcription(self):
 		await self.connect_communicator()
 		try:
@@ -358,35 +427,98 @@ class DoctorDashboardTests(TransactionTestCase):
 
 		self.assertEqual(response.status_code, 404)
 
-	def test_reminder_command_emails_once_and_does_not_include_visit_purpose(self):
-		appointment = self.create_appointment()
+	@override_settings(
+		REMINDER_LEAD_MINUTES=30,
+		REMINDER_MIN_LEAD_TO_REMIND_MINUTES=2,
+	)
+	def test_reminder_policy_uses_thirty_minute_lead_and_skips_imminent_visits(self):
+		now = django_timezone.now()
+		start = now + timedelta(minutes=90)
+		self.assertEqual(first_fire_at(start, now), start - timedelta(minutes=30))
+		self.assertIsNone(first_fire_at(now + timedelta(minutes=1), now))
 
-		with patch(
-			"core.management.commands.send_appointment_reminders.send_mail",
-			return_value=1,
-		) as send_mail:
-			call_command("send_appointment_reminders")
-			call_command("send_appointment_reminders")
+	@override_settings(SNOOZE_MINUTES=15, SNOOZE_MIN_BUFFER_MINUTES=1)
+	def test_snooze_policy_allows_exact_buffer_and_rejects_later(self):
+		now = django_timezone.now()
+		self.assertTrue(snooze_decision(now, now + timedelta(minutes=16)).allowed)
+		self.assertFalse(snooze_decision(now, now + timedelta(minutes=15)).allowed)
 
-		self.assertEqual(send_mail.call_count, 1)
-		self.assertEqual(send_mail.call_args.kwargs["recipient_list"], [self.doctor.email])
-		self.assertIn("Patient Example", send_mail.call_args.kwargs["message"])
-		self.assertNotIn("Routine checkup", send_mail.call_args.kwargs["message"])
+	@override_settings(SNOOZE_MINUTES=15, SNOOZE_MIN_BUFFER_MINUTES=1)
+	def test_snoozing_sets_next_reminder_fifteen_minutes_from_action_only(self):
+		action_time = self.now + timedelta(minutes=3)
+		appointment = self.create_appointment(
+			start_time=self.now + timedelta(minutes=60),
+			end_time=self.now + timedelta(minutes=90),
+		)
+		original_start = appointment.start_time
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
+
+		result = ReminderService.snooze(reminder.pk, now=action_time)
+
+		self.assertTrue(result["ok"])
+		self.assertEqual(result["until"], action_time + timedelta(minutes=15))
 		appointment.refresh_from_db()
-		self.assertIsNotNone(appointment.reminder_sent_at)
+		reminder.refresh_from_db()
+		self.assertEqual(appointment.start_time, original_start)
+		self.assertEqual(reminder.next_fire_at, action_time + timedelta(minutes=15))
 
-	def test_failed_reminder_email_is_reported_and_can_be_retried(self):
-		appointment = self.create_appointment()
+	@override_settings(SNOOZE_MINUTES=15, SNOOZE_MIN_BUFFER_MINUTES=1)
+	def test_custom_snooze_duration_is_used_without_changing_appointment(self):
+		action_time = self.now + timedelta(minutes=3)
+		appointment = self.create_appointment(
+			start_time=self.now + timedelta(minutes=60),
+			end_time=self.now + timedelta(minutes=90),
+		)
+		original_start = appointment.start_time
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
 
-		with patch(
-			"core.management.commands.send_appointment_reminders.send_mail",
-			side_effect=OSError("SMTP unavailable"),
-		):
-			with self.assertRaises(CommandError):
-				call_command("send_appointment_reminders")
+		result = ReminderService.snooze(reminder.pk, now=action_time, minutes=10)
 
+		self.assertTrue(result["ok"])
+		self.assertEqual(result["minutes"], 10)
+		self.assertEqual(result["until"], action_time + timedelta(minutes=10))
 		appointment.refresh_from_db()
-		self.assertIsNone(appointment.reminder_sent_at)
+		reminder.refresh_from_db()
+		self.assertEqual(appointment.start_time, original_start)
+		self.assertEqual(reminder.next_fire_at, action_time + timedelta(minutes=10))
+
+	def test_reminder_scheduler_claims_due_reminder_once_without_email(self):
+		appointment = self.create_appointment(start_time=self.now + timedelta(minutes=10))
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
+		reminder.next_fire_at = self.now
+		reminder.save(update_fields=["next_fire_at"])
+
+		self.assertTrue(claim_and_fire(reminder.pk, self.now))
+		self.assertFalse(claim_and_fire(reminder.pk, self.now))
+		reminder.refresh_from_db()
+		self.assertEqual(reminder.status, Reminder.Status.ACTIVE)
+		self.assertEqual(reminder.last_channel, "in_app")
+		self.assertEqual(ReminderEvent.objects.filter(reminder=reminder, event_type="fired").count(), 1)
+
+	@override_settings(DEBUG=True)
+	def test_active_reminders_api_updates_presence_and_call_token(self):
+		appointment = self.create_appointment(start_time=self.now + timedelta(minutes=10))
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
+		reminder.status = Reminder.Status.ACTIVE
+		reminder.save(update_fields=["status"])
+
+		response = self.client.get("/api/doc/reminders/active/")
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.json()["active"][0]["reminder_id"], reminder.pk)
+		self.doctor.refresh_from_db()
+		self.assertIsNotNone(self.doctor.dashboard_last_seen_at)
+
+		token_response = self.client.post(
+			f"/api/doc/reminders/{reminder.pk}/call-token/",
+		)
+		self.assertEqual(token_response.status_code, 200)
+		self.assertIn("token=", token_response.json()["ws_url"])
+
+	@override_settings(DEBUG=False)
+	def test_reminder_endpoints_are_development_only(self):
+		self.assertEqual(self.client.get("/api/doc/reminders/active/").status_code, 404)
+		self.assertEqual(self.client.post("/api/doc/reminders/1/call-token/").status_code, 404)
 
 
 class GoogleCalendarServiceTests(TransactionTestCase):
@@ -671,7 +803,7 @@ class LLMServiceToolsTests(TransactionTestCase):
 		mock_cal.is_authenticated.assert_not_called()
 		mock_cal.check_availability.assert_not_called()
 
-	def test_book_appointment_persists_to_db_and_creates_task(self):
+	def test_book_appointment_persists_to_db_without_creating_chart_review_task(self):
 		mock_cal = MagicMock()
 		mock_cal.is_authenticated.return_value = True
 		mock_cal.create_event.return_value = {"id": "google-event-123"}
@@ -698,9 +830,7 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertEqual(app.start_time, llm._parse_datetime("2026-10-16 10:00:00"))
 		self.assertEqual(result["start_time"], "Friday, October 16 at 10:00 AM")
 
-		# Verify task created
-		task = Task.objects.get(appointment=app)
-		self.assertIn("John Doe", task.description)
+		self.assertFalse(Task.objects.filter(appointment=app).exists())
 		self.assertEqual(app.google_event_id, "google-event-123")
 
 	def test_book_appointment_defaults_to_thirty_minutes(self):
@@ -768,7 +898,7 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertEqual(result["appointments"][0]["purpose"], "Checkup")
 		self.assertEqual(llm.last_tool_status, "appointments_found")
 
-	def test_reschedule_updates_database_calendar_and_pending_task(self):
+	def test_reschedule_updates_database_calendar_and_reminder(self):
 		mock_cal = MagicMock()
 		mock_cal.is_authenticated.return_value = True
 		llm = LLMService(calendar_service=mock_cal)
@@ -782,13 +912,6 @@ class LLMServiceToolsTests(TransactionTestCase):
 			end_time=old_end,
 			purpose="Checkup",
 			google_event_id="google-event-456",
-			reminder_sent_at=django_timezone.now(),
-		)
-		task = Task.objects.create(
-			doctor=self.doctor,
-			appointment=appointment,
-			description="Review chart",
-			due_time=old_start - timedelta(hours=1),
 		)
 		new_start = old_start + timedelta(days=3)
 		new_start = new_start.replace(hour=23, minute=0)
@@ -802,13 +925,13 @@ class LLMServiceToolsTests(TransactionTestCase):
 		)
 
 		appointment.refresh_from_db()
-		task.refresh_from_db()
 		self.assertEqual(result["status"], "updated")
 		self.assertEqual(llm.last_tool_status, "appointment_rescheduled")
 		self.assertEqual(appointment.start_time, new_start)
 		self.assertEqual(appointment.end_time, new_end)
-		self.assertIsNone(appointment.reminder_sent_at)
-		self.assertEqual(task.due_time, new_start - timedelta(hours=1))
+		reminder = Reminder.objects.get(appointment=appointment)
+		self.assertEqual(reminder.status, Reminder.Status.SCHEDULED)
+		self.assertEqual(reminder.next_fire_at, new_start - timedelta(minutes=30))
 		mock_cal.update_event.assert_called_once_with(
 			event_id="google-event-456",
 			start_time=new_start,
@@ -951,7 +1074,7 @@ class LLMServiceToolsTests(TransactionTestCase):
 			},
 		)
 
-	def test_cancel_appointment_cancels_database_calendar_and_pending_tasks(self):
+	def test_cancel_appointment_cancels_database_calendar_and_reminder(self):
 		mock_cal = MagicMock()
 		mock_cal.is_authenticated.return_value = True
 		llm = LLMService(calendar_service=mock_cal)
@@ -965,21 +1088,12 @@ class LLMServiceToolsTests(TransactionTestCase):
 			purpose="Checkup",
 			google_event_id="google-event-cancel-1",
 		)
-		task = Task.objects.create(
-			doctor=self.doctor,
-			appointment=appointment,
-			description="Review chart",
-			due_time=start_time - timedelta(hours=1),
-		)
-
 		result = llm.cancel_appointment("mike smith", start_time.isoformat())
 
 		appointment.refresh_from_db()
-		task.refresh_from_db()
 		self.assertEqual(result["status"], "cancelled")
 		self.assertEqual(llm.last_tool_status, "appointment_cancelled")
 		self.assertEqual(appointment.status, "Cancelled")
-		self.assertEqual(task.status, "Cancelled")
 		mock_cal.delete_event.assert_called_once_with(event_id="google-event-cancel-1")
 
 	def test_cancel_appointment_calendar_failure_keeps_database_scheduled(self):

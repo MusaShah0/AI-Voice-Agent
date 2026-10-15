@@ -17,10 +17,12 @@ from django.utils import timezone as django_timezone
 
 from .models import Appointment, Doctor, Reminder, ReminderEvent, Task, Transcript
 from .consumers import VoiceConsumer
+from .doc_consumers import DoctorAssistantConsumer
 from .routing import websocket_urlpatterns
 from .reminders.policy import first_fire_at, snooze_decision
 from .reminders.service import ReminderService
 from .reminders.sweep import claim_and_fire
+from .services.appointment_service import AppointmentService
 from .services.calendar_service import GoogleCalendarService
 
 
@@ -30,10 +32,10 @@ class FakeVADService:
 		self.audio_lengths = []
 
 	def is_speech(self, audio_chunk):
-		# First call returns True (speech start), subsequent calls return False (silence endpoint)
 		self.call_count += 1
 		self.audio_lengths.append(len(audio_chunk))
-		return self.call_count == 1
+		audio = np.frombuffer(audio_chunk, dtype=np.int16)
+		return bool(len(audio) and np.count_nonzero(audio) / len(audio) > 0.5)
 
 
 class FakeSTTService:
@@ -197,6 +199,63 @@ class VoiceConsumerTests(TransactionTestCase):
 		finally:
 			await self.communicator.disconnect()
 
+	async def test_markdown_asterisks_are_removed_from_spoken_and_displayed_response(self):
+		await self.connect_communicator()
+		try:
+			with patch.object(
+				FakeLLMService,
+				"stream_dialog",
+				return_value=iter(["**Dr. Melvin** is available."]),
+			):
+				await self.communicator.send_to(text_data=json.dumps({
+					"action": "process_text_turn",
+					"text": "hello",
+				}))
+
+				await self.communicator.receive_json_from(timeout=3)
+				while True:
+					message = await self.communicator.receive_json_from(timeout=3)
+					if message["type"] == "agent_response":
+						break
+
+			self.assertEqual(message["caption"], "Dr. Melvin is available.")
+			self.assertEqual(self.fake_tts.inputs[-1], "Dr. Melvin is available.")
+			transcript = await database_sync_to_async(
+				lambda: Transcript.objects.get(session_id__startswith="session_")
+			)()
+			self.assertEqual(
+				transcript.full_transcript,
+				"User: hello | Agent: Dr. Melvin is available.",
+			)
+		finally:
+			await self.communicator.disconnect()
+
+	async def test_punctuation_only_transcription_returns_retry_prompt(self):
+		await self.connect_communicator()
+		try:
+			with patch.object(FakeSTTService, "transcribe", return_value="."):
+				await self.communicator.send_to(bytes_data=b"\x01\x00" * 8000)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+
+				processing = await self.communicator.receive_json_from(timeout=3)
+				while True:
+					message = await self.communicator.receive_json_from(timeout=3)
+					if message["type"] == "agent_response":
+						break
+
+			self.assertEqual(processing["type"], "processing")
+			self.assertEqual(message["user_transcription"], "")
+			self.assertEqual(
+				message["caption"],
+				"I didn’t catch that. Could you please repeat?",
+			)
+			self.assertEqual(
+				self.fake_tts.inputs[-1],
+				"I didn’t catch that. Could you please repeat?",
+			)
+		finally:
+			await self.communicator.disconnect()
+
 	@override_settings(DEBUG=True)
 	async def test_doctor_reminder_call_snoozes_without_changing_appointment(self):
 		def create_reminder():
@@ -263,6 +322,40 @@ class VoiceConsumerTests(TransactionTestCase):
 		finally:
 			await communicator.disconnect()
 
+	@override_settings(DEBUG=True)
+	async def test_general_doctor_assistant_websocket_connects_without_a_reminder(self):
+		await database_sync_to_async(
+			lambda: Doctor.objects.get_or_create(
+				pk=Doctor.SINGLETON_ID,
+				defaults={
+					"name": "Dr. Melvin",
+					"email": "doctor@example.test",
+					"timezone": "Asia/Karachi",
+				},
+			)
+		)()
+		token = signing.TimestampSigner(salt="core.reminders.call").sign_object(
+			{"doctor_assistant": True}
+		)
+		communicator = WebsocketCommunicator(
+			URLRouter(websocket_urlpatterns),
+			f"/ws/doc-assistant/?token={token}",
+		)
+		connected, denial = await communicator.connect()
+		self.assertTrue(connected, denial)
+		try:
+			ready = await communicator.receive_json_from(timeout=3)
+			self.assertTrue(ready["doctor_assistant"])
+			self.assertEqual(ready["doctor_name"], "Dr. Melvin")
+			while True:
+				message = await communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					self.assertTrue(message["is_welcome"])
+					self.assertIn("upcoming appointments", message["caption"])
+					break
+		finally:
+			await communicator.disconnect()
+
 	async def test_binary_pcm_is_converted_to_float32_for_transcription(self):
 		await self.connect_communicator()
 		try:
@@ -291,6 +384,17 @@ class VoiceConsumerTests(TransactionTestCase):
 		finally:
 			await self.communicator.disconnect()
 
+	async def test_single_vad_positive_does_not_start_transcription(self):
+		await self.connect_communicator()
+		try:
+			await self.communicator.send_to(bytes_data=b"\x01\x00" * 512)
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+
+			self.assertTrue(await self.communicator.receive_nothing(timeout=0.1))
+			self.assertEqual(self.fake_vad.call_count, 2)
+		finally:
+			await self.communicator.disconnect()
+
 	async def test_vad_preserves_partial_windows_between_audio_frames(self):
 		await self.connect_communicator()
 		try:
@@ -311,6 +415,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(self.fake_vad.call_count, 1)
 			self.assertEqual(self.fake_vad.audio_lengths, [1024])
 
+			await self.communicator.send_to(bytes_data=b"\x01\x00" * 1536)
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 8000)
 			self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 3200)
@@ -321,9 +426,9 @@ class VoiceConsumerTests(TransactionTestCase):
 					break
 
 			self.assertEqual(processing["type"], "processing")
-			self.assertEqual(self.fake_vad.call_count, 3)
+			self.assertEqual(self.fake_vad.call_count, 4)
 			self.assertTrue(all(length % 1024 == 0 for length in self.fake_vad.audio_lengths))
-			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 11712))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 13248))
 		finally:
 			await self.communicator.disconnect()
 
@@ -515,10 +620,153 @@ class DoctorDashboardTests(TransactionTestCase):
 		self.assertEqual(token_response.status_code, 200)
 		self.assertIn("token=", token_response.json()["ws_url"])
 
+		assistant_token_response = self.client.post(
+			"/api/doc/assistant/call-token/",
+		)
+		self.assertEqual(assistant_token_response.status_code, 200)
+		self.assertIn("/ws/doc-assistant/?token=", assistant_token_response.json()["ws_url"])
+
+	def test_appointment_service_finds_upcoming_by_patient_or_exact_time(self):
+		mike = self.create_appointment(
+			caller_name="Mike Smith",
+			start_time=self.now + timedelta(hours=2),
+			end_time=self.now + timedelta(hours=2, minutes=30),
+		)
+		self.create_appointment(
+			caller_name="John Doe",
+			start_time=self.now + timedelta(hours=3),
+			end_time=self.now + timedelta(hours=3, minutes=30),
+		)
+		service = AppointmentService()
+
+		by_name = service.find_upcoming(patient_name="mike")
+		by_time = service.find_upcoming(start_time=mike.start_time.isoformat())
+
+		self.assertEqual([item["appointment_id"] for item in by_name], [mike.pk])
+		self.assertEqual([item["patient_name"] for item in by_time], ["Mike Smith"])
+
+	def test_doctor_assistant_uses_database_results_before_answering(self):
+		appointment = self.create_appointment(
+			caller_name="Mike Smith",
+			start_time=self.now + timedelta(hours=2),
+			end_time=self.now + timedelta(hours=2, minutes=30),
+		)
+		consumer = object.__new__(DoctorAssistantConsumer)
+		consumer.assistant_context = {
+			"doctor_name": self.doctor.name,
+			"clinic_tz": self.doctor.timezone,
+		}
+		consumer.known_appointment_ids = set()
+		consumer.pending_action = None
+		consumer.conversation_history = [
+			{"role": "user", "content": "Do I have an appointment with Mike?"},
+		]
+		find_call = SimpleNamespace(
+			id="lookup-1",
+			function=SimpleNamespace(
+				name="find_upcoming_appointments",
+				arguments='{"patient_name":"Mike"}',
+			),
+		)
+		first_message = SimpleNamespace(content=None, tool_calls=[find_call])
+		final_message = SimpleNamespace(
+			content="Yes, Mike Smith has an upcoming appointment.",
+			tool_calls=None,
+		)
+		client = MagicMock()
+		client.chat.completions.create.side_effect = [
+			SimpleNamespace(choices=[SimpleNamespace(message=first_message)]),
+			SimpleNamespace(choices=[SimpleNamespace(message=final_message)]),
+		]
+		consumer.llm = SimpleNamespace(client=client, model_name="test-model")
+
+		response, status, terminal = consumer._assistant_turn(
+			"Do I have an appointment with Mike?",
+			2,
+		)
+
+		self.assertEqual(response, "Yes, Mike Smith has an upcoming appointment.")
+		self.assertIsNone(status)
+		self.assertFalse(terminal)
+		self.assertIn(appointment.pk, consumer.known_appointment_ids)
+		self.assertEqual(client.chat.completions.create.call_count, 2)
+		followup_messages = client.chat.completions.create.call_args_list[1].kwargs["messages"]
+		tool_result = next(item for item in followup_messages if item.get("role") == "tool")
+		self.assertIn("Mike Smith", tool_result["content"])
+
+	def test_doctor_assistant_requires_confirmation_before_cancelling(self):
+		appointment = self.create_appointment(
+			caller_name="Mike Smith",
+			start_time=self.now + timedelta(hours=2),
+			end_time=self.now + timedelta(hours=2, minutes=30),
+		)
+		consumer = object.__new__(DoctorAssistantConsumer)
+		consumer.assistant_context = {"clinic_tz": self.doctor.timezone}
+		consumer.known_appointment_ids = {appointment.pk}
+		consumer.pending_action = None
+		proposal = consumer._run_assistant_tool(
+			AppointmentService(),
+			"propose_cancel",
+			{"appointment_id": appointment.pk},
+			2,
+		)
+
+		self.assertIn("Please say yes to confirm", proposal)
+		appointment.refresh_from_db()
+		self.assertEqual(appointment.status, "Scheduled")
+		with patch("core.services.appointment_service.GoogleCalendarService") as calendar:
+			calendar.return_value.is_authenticated.return_value = False
+			response, status, _ = consumer._assistant_turn("yes", 3)
+
+		appointment.refresh_from_db()
+		self.assertEqual(appointment.status, "Cancelled")
+		self.assertEqual(status, "appointment_cancelled")
+		self.assertIn("Cancelled Mike Smith", response)
+
+	def test_doctor_assistant_requires_confirmation_before_rescheduling(self):
+		appointment = self.create_appointment(
+			caller_name="Mike Smith",
+			start_time=self.now + timedelta(days=1),
+			end_time=self.now + timedelta(days=1, minutes=30),
+		)
+		new_start = self.now + timedelta(days=2)
+		consumer = object.__new__(DoctorAssistantConsumer)
+		consumer.assistant_context = {"clinic_tz": self.doctor.timezone}
+		consumer.known_appointment_ids = {appointment.pk}
+		consumer.pending_action = None
+		with patch("core.services.appointment_service.GoogleCalendarService") as calendar:
+			calendar.return_value.is_authenticated.return_value = False
+			proposal = consumer._run_assistant_tool(
+				AppointmentService(),
+				"propose_reschedule",
+				{
+					"appointment_id": appointment.pk,
+					"new_start_time": new_start.isoformat(),
+				},
+				2,
+			)
+			self.assertIn("Please say yes to confirm", proposal)
+			appointment.refresh_from_db()
+			self.assertNotEqual(appointment.start_time, new_start)
+
+			response, status, _ = consumer._assistant_turn("yes", 3)
+
+		appointment.refresh_from_db()
+		self.assertEqual(appointment.start_time, new_start)
+		self.assertEqual(status, "appointment_rescheduled")
+		self.assertIn("Rescheduled Mike Smith", response)
+
+	@override_settings(DEBUG=False)
+	def test_doctor_assistant_token_is_development_only(self):
+		response = self.client.post("/api/doc/assistant/call-token/")
+
+		self.assertEqual(response.status_code, 404)
+
 	@override_settings(DEBUG=False)
 	def test_reminder_endpoints_are_development_only(self):
 		self.assertEqual(self.client.get("/api/doc/reminders/active/").status_code, 404)
 		self.assertEqual(self.client.post("/api/doc/reminders/1/call-token/").status_code, 404)
+		self.assertEqual(self.client.post("/api/doc/assistant/call-token/").status_code, 404)
 
 
 class GoogleCalendarServiceTests(TransactionTestCase):

@@ -100,6 +100,24 @@
 .doctor-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
 .doctor-page-heading h2 { font-size: 31px; }
 .doctor-page-heading p { margin-top: 7px; color: var(--muted); font-size: 12px; }
+.doctor-heading-actions { display: flex; align-items: center; gap: 12px; }
+.doctor-assistant-start {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid #477c5d;
+  border-radius: 4px;
+  background: #477c5d;
+  color: white;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.doctor-assistant-start:disabled { opacity: .6; cursor: not-allowed; }
 
 .doctor-auto-refresh {
   display: inline-flex;
@@ -235,6 +253,7 @@
   .doctor-refresh-label { display: none; }
   .doctor-content { padding-top: 27px; }
   .doctor-page-heading { align-items: flex-start; flex-direction: column; }
+  .doctor-heading-actions { flex-wrap: wrap; }
   .doctor-page-heading h2 { font-size: 27px; }
   .doctor-tabs button { gap: 5px; padding: 12px 7px; font-size: 9px; }
   .doctor-list-toolbar { align-items: stretch; flex-direction: column; }

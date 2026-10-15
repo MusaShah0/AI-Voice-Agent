@@ -121,3 +121,20 @@ def reminder_call_token(request, reminder_id):
         "token": token,
         "ws_url": f"{websocket_scheme}://{host}/ws/doc-voice/?token={token}",
     })
+
+
+@csrf_exempt
+@require_POST
+def doctor_assistant_call_token(request):
+    if not settings.DEBUG:
+        return JsonResponse({"error": "Doctor assistant is available only in development."}, status=404)
+
+    token = signing.TimestampSigner(salt=CALL_TOKEN_SALT).sign_object(
+        {"doctor_assistant": True}
+    )
+    websocket_scheme = "wss" if request.is_secure() else "ws"
+    host = request.get_host()
+    return JsonResponse({
+        "token": token,
+        "ws_url": f"{websocket_scheme}://{host}/ws/doc-assistant/?token={token}",
+    })

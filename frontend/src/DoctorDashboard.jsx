@@ -6,6 +6,7 @@ import {
   CalendarDays,
   CircleAlert,
   Clock3,
+  Phone,
   RefreshCw,
   Search,
   UserRound,
@@ -120,9 +121,15 @@ function DoctorDashboard() {
     }
   }, [])
 
-  const startReminderCall = async (reminder) => {
+  const refreshDoctorData = useCallback(() => {
+    loadDashboard()
+    loadActiveReminders()
+  }, [loadDashboard, loadActiveReminders])
+
+  const startDoctorCall = async ({ tokenUrl, reminder = null, kind }) => {
     setReminderError('')
-    setStartingCallFor(reminder.reminder_id)
+    const callKey = reminder ? reminder.reminder_id : 'assistant'
+    setStartingCallFor(callKey)
     let stream
     let audioContext
     let cancelled = false
@@ -138,7 +145,7 @@ function DoctorDashboard() {
         audio: {
           channelCount: 1,
           echoCancellation: true,
-          noiseSuppression: false,
+          noiseSuppression: true,
           autoGainControl: true,
         },
       }).then((acquiredStream) => {
@@ -150,7 +157,7 @@ function DoctorDashboard() {
         return acquiredStream
       })
       const responsePromise = fetch(
-        `${API_URL}/api/doc/reminders/${reminder.reminder_id}/call-token/`,
+        `${API_URL}${tokenUrl}`,
         { method: 'POST', headers: { Accept: 'application/json' } },
       )
       const [, , response] = await Promise.all([
@@ -161,7 +168,9 @@ function DoctorDashboard() {
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || `Could not start call (${response.status}).`)
       setActiveCall({
+        kind,
         reminder,
+        title: reminder?.patient_name || dashboard?.doctor?.name || 'Doctor assistant',
         ws_url: result.ws_url,
         stream,
         audioContext,
@@ -177,6 +186,17 @@ function DoctorDashboard() {
       setStartingCallFor(null)
     }
   }
+
+  const startReminderCall = (reminder) => startDoctorCall({
+    tokenUrl: `/api/doc/reminders/${reminder.reminder_id}/call-token/`,
+    reminder,
+    kind: 'reminder',
+  })
+
+  const startAssistantCall = () => startDoctorCall({
+    tokenUrl: '/api/doc/assistant/call-token/',
+    kind: 'assistant',
+  })
 
   useEffect(() => {
     const controller = new AbortController()
@@ -248,7 +268,18 @@ function DoctorDashboard() {
               <h2>Appointments</h2>
               <p>Review the schedule and prepare for upcoming visits.</p>
             </div>
-            <div className="doctor-auto-refresh"><span /> AUTO-REFRESH · 60 SEC</div>
+            <div className="doctor-heading-actions">
+              <button
+                type="button"
+                className="doctor-assistant-start"
+                disabled={Boolean(startingCallFor || activeCall)}
+                onClick={startAssistantCall}
+              >
+                <Phone size={15} />
+                {startingCallFor === 'assistant' ? 'Connecting…' : 'Ask Janus'}
+              </button>
+              <div className="doctor-auto-refresh"><span /> AUTO-REFRESH · 60 SEC</div>
+            </div>
           </div>
 
           {activeReminders.length > 0 && (
@@ -295,7 +326,13 @@ function DoctorDashboard() {
             </section>
           )}
           {reminderError && <div className="doctor-error" role="alert"><CircleAlert size={17} /> {reminderError}</div>}
-          {activeCall && <DoctorCallPanel call={activeCall} onClose={() => setActiveCall(null)} />}
+          {activeCall && (
+            <DoctorCallPanel
+              call={activeCall}
+              onClose={() => setActiveCall(null)}
+              onActionComplete={refreshDoctorData}
+            />
+          )}
 
           <nav className="doctor-tabs" aria-label="Appointment views">
             <button

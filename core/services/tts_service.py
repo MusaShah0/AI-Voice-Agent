@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 _tts_singleton: Optional["TTSService"] = None
 
 
+def clean_spoken_text(text: str) -> str:
+    return text.replace("*", "").strip()
+
+
 class TTSService:
     def __init__(self):
         default_voice_path = (
@@ -37,7 +41,8 @@ class TTSService:
 
     def synthesize(self, text: str) -> Tuple[bytes, int]:
         """Synthesize text into mono signed 16-bit PCM and return audio plus sample rate."""
-        if not text.strip():
+        text = clean_spoken_text(text)
+        if not text:
             return b"", self.sample_rate
 
         audio_chunks = []

@@ -14,10 +14,11 @@ from django.utils import timezone
 from channels.db import database_sync_to_async
 
 from core.consumers import AUDIO_CHUNK_BYTES, AUDIO_SAMPLE_WIDTH, VoiceConsumer
-from core.models import Appointment, Reminder
+from core.models import Appointment, Doctor, Reminder
 from core.reminders.service import ReminderService
 from core.services.appointment_service import AppointmentService
 from core.repositories import DataRepository
+from core.services.tts_service import clean_spoken_text
 from core.views import CALL_TOKEN_SALT
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,13 @@ SNOOZE_REQUEST = re.compile(
     r"(?: please)?$"
 )
 SNOOZE_NEGATION = re.compile(r"\b(?:don't|do not|not|never)\s+(?:please\s+)?snooze\b")
-YES_UTTERANCES = {"yes", "yeah", "confirm", "go ahead", "do it", "okay", "ok"}
-NO_UTTERANCES = {"no", "cancel that", "never mind"}
+YES_UTTERANCES = {
+    "yes", "yeah", "yes please", "confirm", "confirm it", "go ahead", "do it",
+    "please do", "okay", "ok", "sure", "correct", "thats right", "that is right",
+}
+NO_UTTERANCES = {
+    "no", "no please", "cancel that", "never mind", "keep it", "leave it unchanged",
+}
 
 DOCTOR_TOOLS = [
     {
@@ -75,6 +81,55 @@ DOCTOR_TOOLS = [
             "name": "get_today_schedule",
             "description": "List the remaining scheduled appointments today.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+DOCTOR_ASSISTANT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "find_upcoming_appointments",
+            "description": "Find this doctor's upcoming scheduled appointments. Filter by a patient's name, a clinic-local date, or an exact clinic-local start time when provided. Call this before discussing a specific appointment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patient_name": {"type": "string"},
+                    "date": {"type": "string", "description": "Clinic-local date in YYYY-MM-DD format."},
+                    "start_time": {"type": "string", "description": "Exact clinic-local appointment start datetime in ISO 8601 format."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_cancel",
+            "description": "Propose cancelling one appointment returned by find_upcoming_appointments. The doctor must confirm in a later turn before cancellation occurs.",
+            "parameters": {
+                "type": "object",
+                "properties": {"appointment_id": {"type": "integer"}},
+                "required": ["appointment_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_reschedule",
+            "description": "Propose moving one appointment returned by find_upcoming_appointments. The doctor must confirm in a later turn before the appointment changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "appointment_id": {"type": "integer"},
+                    "new_start_time": {"type": "string", "description": "New clinic-local appointment start datetime in ISO 8601 format."},
+                    "new_end_time": {"type": "string", "description": "Optional new clinic-local end datetime. Omit to preserve the appointment duration."},
+                },
+                "required": ["appointment_id", "new_start_time"],
+                "additionalProperties": False,
+            },
         },
     },
 ]
@@ -174,6 +229,7 @@ class DoctorVoiceConsumer(VoiceConsumer):
         return " ".join(parts)
 
     async def _send_doctor_message(self, text, user_text="", tool_status=None, is_welcome=False):
+        text = clean_spoken_text(text)
         self.turn_counter += 1
         turn_id = self.turn_counter
         audio_bytes, sample_rate = await asyncio.to_thread(self.tts.synthesize, text)
@@ -215,6 +271,7 @@ class DoctorVoiceConsumer(VoiceConsumer):
             context,
             turn_id,
         )
+        response = clean_spoken_text(response)
         self.conversation_history.extend([
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": response},
@@ -434,3 +491,288 @@ class DoctorVoiceConsumer(VoiceConsumer):
             ]
             return "Today's remaining appointments are " + ", ".join(lines) + ".", "schedule_checked", False
         return "I can't perform that action.", "error", False
+
+
+class DoctorAssistantConsumer(DoctorVoiceConsumer):
+    async def authorize(self):
+        if not settings.DEBUG:
+            return False
+        query = parse_qs(self.scope.get("query_string", b"").decode("ascii", errors="ignore"))
+        token = query.get("token", [None])[0]
+        if not token:
+            return False
+        try:
+            payload = signing.TimestampSigner(salt=CALL_TOKEN_SALT).unsign_object(
+                token,
+                max_age=120,
+            )
+        except signing.BadSignature:
+            return False
+        return payload == {"doctor_assistant": True}
+
+    async def on_ready(self):
+        doctor = await database_sync_to_async(
+            Doctor.objects.get,
+            thread_sensitive=True,
+        )(pk=Doctor.SINGLETON_ID)
+        self.assistant_context = {
+            "doctor_name": doctor.name,
+            "clinic_tz": doctor.timezone,
+        }
+        self.pending_action = None
+        self.known_appointment_ids = set()
+        greeting = (
+            f"Hello {doctor.name}. I can look up your upcoming appointments by patient, "
+            "date, or time, and help you cancel or reschedule one."
+        )
+        self.conversation_history = [{"role": "assistant", "content": greeting}]
+        await self.send(text_data=json.dumps({
+            "type": "call_ready",
+            "doctor_assistant": True,
+            "doctor_name": doctor.name,
+        }))
+        await self._send_doctor_message(greeting, is_welcome=True)
+
+    async def run_dialog_and_respond(self, user_text):
+        turn_id = self.turn_counter + 1
+        self.conversation_history.append({"role": "user", "content": user_text})
+        response, tool_status, _ = await asyncio.to_thread(
+            self._assistant_turn,
+            user_text,
+            turn_id,
+        )
+        response = clean_spoken_text(response)
+        self.conversation_history.append({"role": "assistant", "content": response})
+        await self._send_doctor_message(
+            response,
+            user_text=user_text,
+            tool_status=tool_status,
+        )
+        try:
+            await database_sync_to_async(
+                DataRepository.save_transcript,
+                thread_sensitive=True,
+            )(
+                session_id=self.session_id,
+                full_transcript=f"User: {user_text} | Agent: {response}",
+            )
+        except Exception:
+            logger.exception("Doctor assistant transcript persistence failed")
+
+    def _assistant_turn(self, user_text, turn_id):
+        text = _normalize(user_text)
+        if self._pending_action_expired():
+            self.pending_action = None
+            if text in YES_UTTERANCES:
+                return "That proposal expired. Please ask me again.", "error", False
+
+        if self.pending_action:
+            if turn_id <= self.pending_action["proposed_in_turn"]:
+                return "Please confirm the proposed change in a new turn.", None, False
+            action = self.pending_action
+            if text in YES_UTTERANCES:
+                self.pending_action = None
+                service = AppointmentService()
+                if action["kind"] == "cancel":
+                    result = service.cancel(action["appointment_id"])
+                    if not result["ok"]:
+                        return result["message"], "error", False
+                    start_display = _format_clinic_time(
+                        result["start_time"],
+                        self.assistant_context["clinic_tz"],
+                        date=True,
+                    )
+                    return (
+                        f"Cancelled {result['patient_name']}'s appointment on {start_display}.",
+                        "appointment_cancelled",
+                        False,
+                    )
+                result = service.reschedule(
+                    action["appointment_id"],
+                    action["new_start_time"],
+                    action["new_end_time"],
+                )
+                if not result["ok"]:
+                    return result["message"], "error", False
+                start_display = _format_clinic_time(
+                    result["start_time"],
+                    self.assistant_context["clinic_tz"],
+                    date=True,
+                )
+                return (
+                    f"Rescheduled {result['patient_name']} to {start_display}.",
+                    "appointment_rescheduled",
+                    False,
+                )
+            if text in NO_UTTERANCES:
+                self.pending_action = None
+                return "Okay, I left the appointment unchanged.", "proposal_discarded", False
+            return "Please say yes to confirm, or no to leave the appointment unchanged.", None, False
+
+        if self.llm.client is None:
+            return "I can't reach the scheduling assistant right now. Please try again.", "error", False
+
+        clinic_timezone = self.assistant_context["clinic_tz"]
+        now_local = timezone.localtime(timezone.now(), ZoneInfo(clinic_timezone))
+        system_prompt = (
+            f"You are {self.assistant_context['doctor_name']}'s clinic scheduling assistant. "
+            "Help the doctor review upcoming appointments and manage only appointments in this clinic's database. "
+            f"The current time is {now_local.isoformat()} in {clinic_timezone}. "
+            "Use find_upcoming_appointments before reporting or changing appointments. Search by patient, "
+            "date, or exact start time as appropriate. If a patient has several matching appointments, read "
+            "the choices and ask which one. Do not invent appointment details or identifiers. "
+            "For cancellation or rescheduling, call the corresponding propose tool only after the doctor "
+            "has clearly identified the exact appointment and provided any new time. The tool will ask for "
+            "confirmation; never say a change is complete until the doctor confirms in a later turn and the "
+            "tool result succeeds. Interpret and speak dates in the clinic timezone. Keep spoken answers concise."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *self.conversation_history,
+        ]
+        service = AppointmentService()
+        for _ in range(4):
+            try:
+                completion = self.llm.client.chat.completions.create(
+                    model=settings.DOCTOR_GROQ_MODEL or self.llm.model_name,
+                    messages=messages,
+                    tools=DOCTOR_ASSISTANT_TOOLS,
+                    tool_choice="auto",
+                    max_completion_tokens=300,
+                    reasoning_effort="low",
+                )
+            except Exception:
+                logger.exception("Doctor assistant model request failed")
+                return "I couldn't process that request just now. Please try again.", "error", False
+
+            message = completion.choices[0].message
+            tool_calls = message.tool_calls or []
+            if not tool_calls:
+                return message.content or "What would you like to know about the schedule?", None, False
+
+            messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
+            for call in tool_calls:
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    result = {"error": "Invalid tool arguments. Ask the doctor to clarify."}
+                else:
+                    result = (
+                        self._run_assistant_tool(
+                            service,
+                            call.function.name,
+                            arguments,
+                            turn_id,
+                        )
+                        if isinstance(arguments, dict)
+                        else {"error": "Invalid tool arguments. Ask the doctor to clarify."}
+                    )
+                if isinstance(result, str):
+                    return result, "appointment_change_proposed", False
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, default=str),
+                })
+        return "I couldn't complete that schedule lookup. Please try a more specific request.", "error", False
+
+    def _run_assistant_tool(self, service, name, arguments, turn_id):
+        if name == "find_upcoming_appointments":
+            try:
+                appointments = service.find_upcoming(
+                    patient_name=arguments.get("patient_name"),
+                    date=arguments.get("date"),
+                    start_time=arguments.get("start_time"),
+                )
+            except (TypeError, ValueError):
+                return {"error": "The requested date or time was invalid."}
+            self.known_appointment_ids.update(
+                item["appointment_id"] for item in appointments
+            )
+            return {"appointments": appointments}
+
+        try:
+            appointment_id = int(arguments["appointment_id"])
+        except (KeyError, TypeError, ValueError):
+            return {"error": "A valid appointment identifier from a schedule lookup is required."}
+        if appointment_id not in self.known_appointment_ids:
+            return {"error": "Look up the appointment in this session before proposing a change."}
+        appointment = service.get_upcoming(appointment_id)
+        if appointment is None:
+            return {"error": "That appointment is no longer scheduled or is not in this doctor's schedule."}
+
+        clinic_timezone = self.assistant_context["clinic_tz"]
+        start_display = _format_clinic_time(
+            appointment.start_time,
+            clinic_timezone,
+            date=True,
+        )
+        if name == "propose_cancel":
+            self.pending_action = {
+                "kind": "cancel",
+                "appointment_id": appointment.pk,
+                "patient_name": appointment.caller_name,
+                "proposed_in_turn": turn_id,
+                "created_at": timezone.now(),
+            }
+            return (
+                f"Cancel {appointment.caller_name}'s appointment on {start_display}? "
+                "Please say yes to confirm or no to keep it."
+            )
+        if name == "propose_reschedule":
+            new_start = arguments.get("new_start_time")
+            if not new_start:
+                return {"error": "The new appointment start time is required."}
+            try:
+                parsed_start = service._parse_datetime(new_start, clinic_timezone)
+                parsed_end = (
+                    service._parse_datetime(arguments["new_end_time"], clinic_timezone)
+                    if arguments.get("new_end_time")
+                    else parsed_start + (appointment.end_time - appointment.start_time)
+                )
+            except (TypeError, ValueError):
+                return {"error": "The new appointment time is invalid."}
+            availability = service.check_availability(
+                parsed_start,
+                parsed_end,
+                exclude_appointment_id=appointment.pk,
+            )
+            if not availability["ok"]:
+                return {"error": availability["message"]}
+            if availability["start_time"] <= timezone.now():
+                return {"error": "The new appointment time must be in the future."}
+            proposed_start = availability["start_time"]
+            proposed_end = availability["end_time"]
+            proposed_display = _format_clinic_time(
+                proposed_start,
+                clinic_timezone,
+                date=True,
+            )
+            self.pending_action = {
+                "kind": "reschedule",
+                "appointment_id": appointment.pk,
+                "patient_name": appointment.caller_name,
+                "new_start_time": proposed_start.isoformat(),
+                "new_end_time": proposed_end.isoformat(),
+                "proposed_in_turn": turn_id,
+                "created_at": timezone.now(),
+            }
+            return (
+                f"Move {appointment.caller_name}'s appointment to {proposed_display}? "
+                "Please say yes to confirm or no to leave it unchanged."
+            )
+        return {"error": "That scheduling action is not available."}

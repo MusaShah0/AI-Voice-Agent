@@ -20,7 +20,7 @@ function pcm16FromFloat(input, inputSampleRate) {
   return output.buffer
 }
 
-function DoctorCallPanel({ call, onClose }) {
+function DoctorCallPanel({ call, onClose, onActionComplete }) {
   const [connected, setConnected] = useState(false)
   const [recording, setRecording] = useState(false)
   const [pending, setPending] = useState(false)
@@ -142,6 +142,12 @@ function DoctorCallPanel({ call, onClose }) {
       } else if (message.type === 'agent_response') {
         if (message.caption) setCaption(message.caption)
         setPending(false)
+        if (
+          message.tool_status === 'appointment_cancelled'
+          || message.tool_status === 'appointment_rescheduled'
+        ) {
+          onActionComplete?.()
+        }
         if (message.is_welcome) receivingRef.current = true
       } else if (message.type === 'processing') {
         setPending(true)
@@ -203,14 +209,16 @@ function DoctorCallPanel({ call, onClose }) {
         cleanupTimerRef.current = null
       }, 0)
     }
-  }, [call.audioContext, call.stream, call.ws_url, playAudioChunk, stopSession])
+  }, [call.audioContext, call.stream, call.ws_url, onActionComplete, playAudioChunk, stopSession])
 
   return (
     <section className="doctor-call-panel" role="dialog" aria-modal="true" aria-label="Doctor reminder call">
       <header>
         <div>
-          <span className="doctor-eyebrow">REMINDER CALL</span>
-          <h3>{call.reminder.patient_name}</h3>
+          <span className="doctor-eyebrow">
+            {call.kind === 'assistant' ? 'DOCTOR ASSISTANT' : 'REMINDER CALL'}
+          </span>
+          <h3>{call.title || call.reminder?.patient_name}</h3>
         </div>
         <button
           type="button"
@@ -220,13 +228,15 @@ function DoctorCallPanel({ call, onClose }) {
           <X size={17} />
         </button>
       </header>
-      <p className="doctor-call-time">
-        Starts {new Date(call.reminder.start_time).toLocaleString([], {
-          weekday: 'short',
-          hour: 'numeric',
-          minute: '2-digit',
-        })}
-      </p>
+      {call.reminder && (
+        <p className="doctor-call-time">
+          Starts {new Date(call.reminder.start_time).toLocaleString([], {
+            weekday: 'short',
+            hour: 'numeric',
+            minute: '2-digit',
+          })}
+        </p>
+      )}
       <div className="doctor-call-caption" aria-live="polite">
         {caption || 'Connect to hear the reminder and speak with the assistant.'}
       </div>

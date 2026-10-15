@@ -12,4 +12,9 @@ urlpatterns = [
         views.reminder_call_token,
         name='reminder-call-token',
     ),
+    path(
+        'api/doc/assistant/call-token/',
+        views.doctor_assistant_call_token,
+        name='doctor-assistant-call-token',
+    ),
 ]

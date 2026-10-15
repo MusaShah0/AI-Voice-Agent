@@ -16,13 +16,14 @@ from .repositories import DataRepository
 from .services.vad_service import VADService, get_vad_service
 from .services.stt_service import STTService, get_stt_service
 from .services.llm_service import LLMService
-from .services.tts_service import TTSService, get_tts_service
+from .services.tts_service import TTSService, clean_spoken_text, get_tts_service
 
 logger = logging.getLogger(__name__)
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_SAMPLE_WIDTH = 2
 VAD_WINDOW_BYTES = 512 * AUDIO_SAMPLE_WIDTH
+SPEECH_CONFIRMATION_BYTES = 3 * VAD_WINDOW_BYTES
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
@@ -74,6 +75,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         # Audio buffering & speech state
         self.audio_buffer = bytearray()
         self.pre_speech_buffer = bytearray()
+        self.speech_candidate_buffer = bytearray()
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None
@@ -219,6 +221,13 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             ):
                 return
 
+            speech_just_confirmed = False
+            if has_speech and not self.speech_detected:
+                self.speech_candidate_buffer.extend(clean_chunk)
+                if len(self.speech_candidate_buffer) < SPEECH_CONFIRMATION_BYTES:
+                    return
+                speech_just_confirmed = True
+
             if self.speech_detected or has_speech:
                 self.speech_vad_elapsed_seconds += vad_elapsed
 
@@ -247,10 +256,13 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                         self.session_id,
                         len(self.pre_speech_buffer),
                     )
+                    self.audio_buffer.extend(self.speech_candidate_buffer)
+                    self.speech_candidate_buffer.clear()
                     self.pre_speech_buffer.clear()
 
                 self.consecutive_silence_bytes = 0
-                self.audio_buffer.extend(clean_chunk)
+                if not speech_just_confirmed:
+                    self.audio_buffer.extend(clean_chunk)
 
                 # 3. Maximum speech duration safeguard
                 if len(self.audio_buffer) >= MAX_SPEECH_BYTES:
@@ -300,6 +312,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                             )
                             self._reset_speech_state()
                 else:
+                    self.speech_candidate_buffer.clear()
                     # Ambient background before speech: maintain rolling pre-speech buffer
                     self.pre_speech_buffer.extend(clean_chunk)
                     if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
@@ -378,6 +391,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
     def _reset_speech_state(self):
         self.audio_buffer.clear()
         self.pre_speech_buffer.clear()
+        self.speech_candidate_buffer.clear()
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None
@@ -480,13 +494,14 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             logger.exception("Pipeline STT failed session=%s", self.session_id)
             user_text = ""
 
-        if user_text.strip():
+        if any(character.isalnum() for character in user_text):
             await self.run_dialog_and_respond(user_text)
         else:
             logger.warning(
-                "Pipeline STT: no speech transcription produced session=%s audio_bytes=%s",
+                "Pipeline STT: no speech transcription produced session=%s audio_bytes=%s transcript_characters=%s",
                 self.session_id,
                 len(audio_data),
+                len(user_text),
             )
             await self._respond_to_unrecognized_audio()
 
@@ -561,7 +576,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
         async def synthesize_and_send(sentence: str):
             nonlocal sequence
-            sentence = sentence.strip()
+            sentence = clean_spoken_text(sentence)
             if not sentence:
                 return
 
@@ -621,14 +636,14 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                     boundary = SENTENCE_BOUNDARY.search(sentence_buffer)
                     if boundary is None:
                         break
-                    sentence = sentence_buffer[:boundary.end()].strip()
+                    sentence = clean_spoken_text(sentence_buffer[:boundary.end()])
                     preceding_word = re.search(r"(?:^|\s)([\w.]+)$", sentence)
                     if preceding_word and preceding_word.group(1).lower() in SENTENCE_ABBREVIATIONS:
                         next_boundary = SENTENCE_BOUNDARY.search(sentence_buffer, boundary.end())
                         if next_boundary is None:
                             break
                         boundary = next_boundary
-                        sentence = sentence_buffer[:boundary.end()].strip()
+                        sentence = clean_spoken_text(sentence_buffer[:boundary.end()])
                     sentence_buffer = sentence_buffer[boundary.end():]
                     await synthesize_and_send(sentence)
 
@@ -643,7 +658,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             except asyncio.CancelledError:
                 pass
 
-        response_text = "".join(response_parts).strip()
+        response_text = clean_spoken_text("".join(response_parts))
         tool_status = self.llm.last_tool_status
         logger.info(
             "Pipeline dialog: completed session=%s response_characters=%s tool_status=%s elapsed_ms=%.2f",

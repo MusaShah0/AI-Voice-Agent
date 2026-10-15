@@ -72,11 +72,72 @@ class AppointmentService:
             for row in rows
         ]
 
+    def find_upcoming(self, patient_name=None, date=None, start_time=None, now=None):
+        now = now or timezone.now()
+        doctor = Doctor.objects.get(pk=Doctor.SINGLETON_ID)
+        clinic_timezone = ZoneInfo(doctor.timezone)
+        appointments = Appointment.objects.filter(
+            doctor=doctor,
+            status="Scheduled",
+            start_time__gte=now,
+        )
+        if patient_name:
+            name = patient_name.strip()
+            if not name:
+                return []
+            appointments = appointments.filter(caller_name__icontains=name)
+        if start_time:
+            requested_start = self._parse_datetime(start_time, doctor.timezone)
+            minute_start = requested_start.replace(second=0, microsecond=0)
+            appointments = appointments.filter(
+                start_time__gte=minute_start,
+                start_time__lt=minute_start + datetime.timedelta(minutes=1),
+            )
+        elif date:
+            requested_date = datetime.date.fromisoformat(str(date))
+            day_start = datetime.datetime.combine(
+                requested_date,
+                datetime.time.min,
+                tzinfo=clinic_timezone,
+            )
+            appointments = appointments.filter(
+                start_time__gte=day_start,
+                start_time__lt=day_start + datetime.timedelta(days=1),
+            )
+
+        return [
+            {
+                "appointment_id": appointment.pk,
+                "patient_name": appointment.caller_name,
+                "start_time": timezone.localtime(
+                    appointment.start_time,
+                    clinic_timezone,
+                ).isoformat(),
+                "end_time": timezone.localtime(
+                    appointment.end_time,
+                    clinic_timezone,
+                ).isoformat(),
+                "purpose": appointment.purpose,
+            }
+            for appointment in appointments.order_by("start_time")[:20]
+        ]
+
+    def get_upcoming(self, appointment_id, now=None):
+        now = now or timezone.now()
+        return Appointment.objects.filter(
+            pk=appointment_id,
+            doctor_id=Doctor.SINGLETON_ID,
+            status="Scheduled",
+            start_time__gte=now,
+        ).first()
+
     def reschedule(self, appointment_id, new_start, new_end=None):
         try:
             appointment = Appointment.objects.get(
                 pk=appointment_id,
+                doctor_id=Doctor.SINGLETON_ID,
                 status="Scheduled",
+                start_time__gte=timezone.now(),
             )
         except Appointment.DoesNotExist:
             return {"ok": False, "status": "not_found", "message": "That appointment is no longer scheduled."}
@@ -164,4 +225,59 @@ class AppointmentService:
             "end_time": end_time,
             "calendar_synced": calendar_synced,
             "patient_name": appointment.caller_name,
+        }
+
+    def cancel(self, appointment_id):
+        appointment = self.get_upcoming(appointment_id)
+        if appointment is None:
+            return {
+                "ok": False,
+                "status": "not_found",
+                "message": "That appointment is no longer scheduled.",
+            }
+
+        calendar_synced = False
+        if self.calendar_service.is_authenticated():
+            if not appointment.google_event_id:
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "message": "This appointment has no linked calendar event, so it was not cancelled.",
+                }
+            try:
+                self.calendar_service.delete_event(event_id=appointment.google_event_id)
+                calendar_synced = True
+            except Exception:
+                logger.exception(
+                    "Doctor assistant cancellation calendar delete failed appointment_id=%s",
+                    appointment.pk,
+                )
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "message": "The calendar could not cancel this event, so the appointment was not changed.",
+                }
+
+        try:
+            result = DataRepository.cancel_appointment_sync(appointment.pk)
+            if result["status"] != "cancelled":
+                raise RuntimeError("The appointment could not be cancelled in the database.")
+        except Exception:
+            logger.exception(
+                "Doctor assistant cancellation database update failed appointment_id=%s",
+                appointment.pk,
+            )
+            return {
+                "ok": False,
+                "status": "error",
+                "message": "The appointment could not be cancelled in the scheduling database.",
+            }
+
+        return {
+            "ok": True,
+            "status": "cancelled",
+            "appointment_id": appointment.pk,
+            "patient_name": appointment.caller_name,
+            "start_time": appointment.start_time,
+            "calendar_synced": calendar_synced,
         }

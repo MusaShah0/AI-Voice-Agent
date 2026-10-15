@@ -298,16 +298,24 @@ class VoiceConsumerTests(TransactionTestCase):
 					self.assertNotIn("Dr. Dr.", message["caption"])
 					break
 
-			await communicator.send_to(text_data=json.dumps({
-				"action": "process_text_turn",
-				"text": "Could you please snooze it for 10 minutes?",
-			}))
-			self.assertEqual((await communicator.receive_json_from(timeout=3))["type"], "processing")
-			while True:
-				message = await communicator.receive_json_from(timeout=3)
-				if message["type"] == "agent_response":
-					self.assertEqual(message["tool_status"], "reminder_snoozed")
-					break
+			with patch.object(FakeSTTService, "transcribe", return_value="snooze"), patch.object(
+				self.fake_vad,
+				"is_speech",
+				side_effect=[True, False, True, True] + [False] * 24,
+			):
+				for is_speech in (True, False, True, True):
+					value = b"\x01\x00" if is_speech else b"\x00\x00"
+					await communicator.send_to(bytes_data=value * 512)
+				await communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+
+				processing = await communicator.receive_json_from(timeout=3)
+				self.assertEqual(processing["type"], "processing")
+				while True:
+					message = await communicator.receive_json_from(timeout=3)
+					if message["type"] == "agent_response":
+						self.assertEqual(message["user_transcription"], "snooze")
+						self.assertEqual(message["tool_status"], "reminder_snoozed")
+						break
 			ended = await communicator.receive_json_from(timeout=3)
 			self.assertEqual(ended, {"type": "call_ended", "reason": "reminder_snoozed"})
 			reminder = await database_sync_to_async(Reminder.objects.select_related("appointment").get)(
@@ -315,7 +323,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			)
 			self.assertEqual(reminder.status, Reminder.Status.SNOOZED)
 			self.assertLess(
-				abs((reminder.next_fire_at - reminder.last_call_at - timedelta(minutes=10)).total_seconds()),
+				abs((reminder.next_fire_at - reminder.last_call_at - timedelta(minutes=15)).total_seconds()),
 				2,
 			)
 			self.assertEqual(reminder.appointment.start_time, start_time)
@@ -392,6 +400,32 @@ class VoiceConsumerTests(TransactionTestCase):
 
 			self.assertTrue(await self.communicator.receive_nothing(timeout=0.1))
 			self.assertEqual(self.fake_vad.call_count, 2)
+		finally:
+			await self.communicator.disconnect()
+
+	async def test_speech_starts_when_three_vad_positives_have_a_brief_gap(self):
+		await self.connect_communicator()
+		try:
+			with patch.object(
+				self.fake_vad,
+				"is_speech",
+				side_effect=[True, False, True, True] + [False] * 24,
+			):
+				for is_speech in (True, False, True, True):
+					value = b"\x01\x00" if is_speech else b"\x00\x00"
+					await self.communicator.send_to(bytes_data=value * 512)
+
+				self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+
+				processing = await self.communicator.receive_json_from(timeout=3)
+				while True:
+					message = await self.communicator.receive_json_from(timeout=3)
+					if message["type"] == "agent_response":
+						break
+
+			self.assertEqual(processing["type"], "processing")
+			self.assertEqual(message["user_transcription"], "test transcription")
 		finally:
 			await self.communicator.disconnect()
 

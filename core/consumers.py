@@ -24,6 +24,7 @@ AUDIO_SAMPLE_RATE = 16000
 AUDIO_SAMPLE_WIDTH = 2
 VAD_WINDOW_BYTES = 512 * AUDIO_SAMPLE_WIDTH
 SPEECH_CONFIRMATION_BYTES = 3 * VAD_WINDOW_BYTES
+SPEECH_CANDIDATE_MAX_GAP_BYTES = 2 * VAD_WINDOW_BYTES
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
@@ -76,6 +77,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.audio_buffer = bytearray()
         self.pre_speech_buffer = bytearray()
         self.speech_candidate_buffer = bytearray()
+        self.speech_candidate_positive_bytes = 0
+        self.speech_candidate_silence_bytes = 0
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None
@@ -222,11 +225,29 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 return
 
             speech_just_confirmed = False
-            if has_speech and not self.speech_detected:
-                self.speech_candidate_buffer.extend(clean_chunk)
-                if len(self.speech_candidate_buffer) < SPEECH_CONFIRMATION_BYTES:
+            if not self.speech_detected:
+                if has_speech:
+                    self.speech_candidate_buffer.extend(clean_chunk)
+                    self.speech_candidate_positive_bytes += len(vad_audio)
+                    self.speech_candidate_silence_bytes = 0
+                elif self.speech_candidate_buffer:
+                    self.speech_candidate_buffer.extend(clean_chunk)
+                    self.speech_candidate_silence_bytes += len(clean_chunk)
+                    if self.speech_candidate_silence_bytes > SPEECH_CANDIDATE_MAX_GAP_BYTES:
+                        self.pre_speech_buffer.extend(self.speech_candidate_buffer)
+                        if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
+                            del self.pre_speech_buffer[:-PRE_SPEECH_BUFFER_BYTES]
+                        self.speech_candidate_buffer.clear()
+                        self.speech_candidate_positive_bytes = 0
+                        self.speech_candidate_silence_bytes = 0
                     return
-                speech_just_confirmed = True
+
+                if (
+                    self.speech_candidate_buffer
+                    and self.speech_candidate_positive_bytes < SPEECH_CONFIRMATION_BYTES
+                ):
+                    return
+                speech_just_confirmed = bool(self.speech_candidate_buffer)
 
             if self.speech_detected or has_speech:
                 self.speech_vad_elapsed_seconds += vad_elapsed
@@ -258,6 +279,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                     )
                     self.audio_buffer.extend(self.speech_candidate_buffer)
                     self.speech_candidate_buffer.clear()
+                    self.speech_candidate_positive_bytes = 0
+                    self.speech_candidate_silence_bytes = 0
                     self.pre_speech_buffer.clear()
 
                 self.consecutive_silence_bytes = 0
@@ -313,6 +336,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                             self._reset_speech_state()
                 else:
                     self.speech_candidate_buffer.clear()
+                    self.speech_candidate_positive_bytes = 0
+                    self.speech_candidate_silence_bytes = 0
                     # Ambient background before speech: maintain rolling pre-speech buffer
                     self.pre_speech_buffer.extend(clean_chunk)
                     if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
@@ -392,6 +417,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.audio_buffer.clear()
         self.pre_speech_buffer.clear()
         self.speech_candidate_buffer.clear()
+        self.speech_candidate_positive_bytes = 0
+        self.speech_candidate_silence_bytes = 0
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None

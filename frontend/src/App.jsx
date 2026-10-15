@@ -1,14 +1,13 @@
 import { useRef, useState } from 'react'
 import DoctorDashboard from './DoctorDashboard'
+import LiveOrb from './LiveOrb'
 import {
-  AudioLines,
   CircleHelp,
   Headphones,
   LoaderCircle,
-  Mic,
-  MicOff,
   Send,
   Square,
+  ShieldCheck,
   Wifi,
   WifiOff,
 } from 'lucide-react'
@@ -94,6 +93,18 @@ function PatientApp() {
   const playbackQueueRef = useRef(Promise.resolve())
   const cancelledAudioTurnRef = useRef(0)
   const latestAudioTurnRef = useRef(null)
+  const terminalCallPendingRef = useRef(false)
+  const terminalCallEndedRef = useRef(false)
+
+  const finishTerminalSession = () => {
+    if (!terminalCallPendingRef.current || !terminalCallEndedRef.current) return
+    terminalCallPendingRef.current = false
+    terminalCallEndedRef.current = false
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ action: 'end_call' }))
+    }
+    void disconnect(false)
+  }
 
   const stopPlayback = () => {
     playbackGenerationRef.current += 1
@@ -140,6 +151,7 @@ function PatientApp() {
       playbackCompleteRef.current = false
       setIsPlaying(false)
       inputSuppressedRef.current = false
+      if (terminalCallPendingRef.current) finishTerminalSession()
     }
   }
 
@@ -217,6 +229,7 @@ function PatientApp() {
     }
 
     if (message.type === 'agent_response') {
+      if (message.terminal) terminalCallPendingRef.current = true
       if (!message.is_welcome) {
         setTurns((current) => current.concat({
           user: message.user_transcription,
@@ -276,6 +289,19 @@ function PatientApp() {
       setPending(true)
       inputSuppressedRef.current = true
       setError('')
+    } else if (message.type === 'call_ended') {
+      terminalCallPendingRef.current = true
+      terminalCallEndedRef.current = true
+      playbackQueueRef.current = playbackQueueRef.current.then(() => {
+        if (
+          playbackTurnRef.current === null
+          && playbackSourcesRef.current.size === 0
+        ) {
+          finishTerminalSession()
+        } else {
+          finishPlaybackIfReady()
+        }
+      })
     }
   }
 
@@ -301,6 +327,8 @@ function PatientApp() {
     setError('')
     inputSuppressedRef.current = false
     const socketGeneration = ++socketGenerationRef.current
+    terminalCallPendingRef.current = false
+    terminalCallEndedRef.current = false
     cancelledAudioTurnRef.current = 0
     latestAudioTurnRef.current = null
     playbackQueueRef.current = Promise.resolve()
@@ -517,8 +545,10 @@ function PatientApp() {
     }
   }
 
-  const disconnect = async () => {
-    await stopMicrophone()
+  const disconnect = async (notifyBackend = true) => {
+    terminalCallPendingRef.current = false
+    terminalCallEndedRef.current = false
+    await stopMicrophone(notifyBackend)
     finalizedCaptionRef.current = ''
     setLiveCaption('')
     setLiveCaptionNotice('')
@@ -571,107 +601,100 @@ function PatientApp() {
     connecting: 'Connecting',
     connected: 'Connected',
   }[connectionState]
+  const voiceStatus = pending
+    ? 'Finding the right answer'
+    : isPlaying
+      ? 'Janus is speaking'
+      : isRecording
+        ? 'Listening to you'
+        : 'Tap to Talk'
+  const voiceInstruction = pending
+    ? 'Checking the schedule and preparing a response.'
+    : isPlaying
+      ? 'You can interrupt the reply at any time.'
+      : isRecording
+        ? 'Tell us what you need, then tap the button to finish.'
+        : ''
 
   return (
-    <div className="app-shell">
-      <aside className="side-rail" aria-label="Application">
-        <div className="brand-mark"><AudioLines size={22} strokeWidth={2.2} /></div>
-        <span className="rail-caption">DR.<br />MELVIN</span>
-        <div className="rail-spacer" />
-      </aside>
-
+    <div className={`app-shell patient-shell voice-${pending ? 'thinking' : isPlaying ? 'speaking' : isRecording ? 'listening' : 'idle'}`}>
       <div className="app-main">
-        <header className="topbar">
-          <div>
-            <div className="eyebrow">DR. MELVIN'S OFFICE <span>/</span> PATIENT CARE</div>
-            <h1>Appointment scheduler</h1>
-          </div>
-          <div className={`connection-pill ${connectionState}`}>
-            {connectionState === 'connected' ? <Wifi size={15} /> : <WifiOff size={15} />}
-            <span className="connection-dot" />
-            {connectionLabel}
-          </div>
-        </header>
-
         <main className="workspace">
           <section className="session-panel" aria-labelledby="session-title">
-            <div className="section-heading">
-              <div>
-                <div className="eyebrow">SCHEDULE A VISIT</div>
-                <h2 id="session-title">How can we help?</h2>
+            <div className="session-intro">
+              <div className="intro-copy">
+                <div className="eyebrow"><span className="eyebrow-mark" /> JANUS · DR. MELVIN’S AI ASSISTANT</div>
+                <h2 id="session-title">What can I help you with?</h2>
+                <p>Book, review, or manage your appointments with Janus.</p>
               </div>
             </div>
 
-            <div className={`mic-stage ${isRecording ? 'recording' : ''}`}>
-              <div className="stage-topline">
-                <span>{pending ? 'WORKING ON IT' : isRecording ? 'LISTENING' : 'HERE TO HELP'}</span>
-                <span className="stage-time">{pending ? 'PLEASE WAIT' : isRecording ? 'YOUR TURN' : 'VOICE APPOINTMENTS'}</span>
-              </div>
-              <div className="mic-action-wrap">
-                <div className="waveform" aria-hidden="true">
-                  {Array.from({ length: 21 }, (_, index) => (
-                    <i key={index} style={{ '--bar': index }} />
-                  ))}
-                </div>
+            <div className={`mic-stage ${isRecording ? 'recording' : ''} ${pending ? 'processing' : ''} ${isPlaying ? 'speaking' : ''}`}>
+              <div className="stage-grain" aria-hidden="true" />
+              <div className="orb-scene">
+                <div className="orb-halo orb-halo-outer" aria-hidden="true" />
+                <div className="orb-halo orb-halo-inner" aria-hidden="true" />
+                <div className="orb-aura" aria-hidden="true" />
                 <button
                   className={`mic-button ${isRecording ? 'is-recording' : ''}`}
                   type="button"
-                  onClick={startMicrophone}
-                  disabled={connectionState === 'connecting'}
-                  aria-label={isRecording ? 'Stop listening' : 'Start a voice appointment'}
-                  title={isRecording ? 'Stop listening' : 'Start a voice appointment'}
+                  onClick={isRecording ? () => stopMicrophone() : startMicrophone}
+                  disabled={connectionState === 'connecting' || (pending && !isRecording)}
+                  aria-label={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
+                  title={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
                 >
-                  {isRecording ? <Square size={23} fill="currentColor" /> : <Mic size={28} />}
+                  <LiveOrb size="100%" interactive />
                 </button>
-                <div className="waveform waveform-right" aria-hidden="true">
-                  {Array.from({ length: 21 }, (_, index) => (
-                    <i key={index} style={{ '--bar': index }} />
+                <div className="orb-particles" aria-hidden="true">
+                  {Array.from({ length: 12 }, (_, index) => (
+                    <i
+                      key={index}
+                      style={{
+                        '--particle': index,
+                        left: `${50 + Math.cos(index * Math.PI / 6) * 47.75}%`,
+                        top: `${50 + Math.sin(index * Math.PI / 6) * 47.75}%`,
+                      }}
+                    />
                   ))}
                 </div>
               </div>
               <div className="stage-caption">
-                <strong>{pending ? 'Preparing your appointment details' : isRecording ? 'I’m listening' : 'Talk with Dr. Melvin’s office'}</strong>
-                <span>{pending ? 'This may take a few moments.' : isRecording ? 'Tell us what day or time works for you.' : 'Ask about availability or schedule a visit.'}</span>
+                <span className="stage-live-status"><i /> {voiceStatus}</span>
+                {voiceInstruction && <p>{voiceInstruction}</p>}
+                <div className="voice-equalizer" aria-hidden="true">
+                  {Array.from({ length: 31 }, (_, index) => (
+                    <i key={index} style={{ '--bar': index }} />
+                  ))}
+                </div>
               </div>
-            </div>
-
-            <div className="session-actions">
-              {isRecording ? (
-                <button className="button button-dark" type="button" onClick={() => stopMicrophone()}>
-                  <MicOff size={16} /> Stop listening
-                </button>
-              ) : (
-                <button
-                  className="button button-coral"
-                  type="button"
-                  onClick={startMicrophone}
-                  disabled={connectionState === 'connecting'}
-                >
-                  <Mic size={16} /> Start voice appointment
-                </button>
-              )}
-              {connectionState !== 'disconnected' && (
-                <button className="button button-quiet" type="button" onClick={disconnect}>
-                  Disconnect
-                </button>
-              )}
               {isPlaying && (
-                <button className="icon-button" type="button" onClick={interrupt} aria-label="Stop reply audio" title="Stop reply audio">
-                  <Square size={16} fill="currentColor" />
+                <button className="interrupt-button" type="button" onClick={interrupt}>
+                  <Square size={12} fill="currentColor" /> Stop reply
                 </button>
               )}
             </div>
 
-            <div className="text-test">
-              <div className="text-test-heading">
-                <span>Prefer to type?</span>
-                <span>Send us a message</span>
+            {connectionState !== 'disconnected' && (
+              <div className="session-actions">
+                <button className="disconnect-button" type="button" onClick={disconnect}>
+                  End conversation
+                </button>
+              </div>
+            )}
+
+            <div className="text-entry">
+              <div className="text-entry-heading">
+                <div>
+                  <span className="eyebrow">PREFER TO TYPE?</span>
+                  <strong>Send Janus a message</strong>
+                </div>
+                <span className="text-entry-note">Text works just as well</span>
               </div>
               <form className="text-form" onSubmit={sendTextTurn}>
                 <input
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
-                  placeholder="Ask about appointments..."
+                  placeholder="Ask about availability or booking a visit…"
                   aria-label="Message Dr. Melvin's office"
                   disabled={pending}
                 />
@@ -679,6 +702,10 @@ function PatientApp() {
                   <Send size={17} />
                 </button>
               </form>
+              <div className="suggestion-list" aria-label="Suggested questions">
+                <button type="button" onClick={() => setDraft('I’d like to book an appointment')}>Book a visit <span>↗</span></button>
+                <button type="button" onClick={() => setDraft('What appointment times are available?')}>Check availability <span>↗</span></button>
+              </div>
             </div>
 
             {error && <div className="error-banner" role="alert"><CircleHelp size={16} />{error}</div>}
@@ -686,77 +713,87 @@ function PatientApp() {
 
           <section className="transcript-panel" aria-labelledby="transcript-title">
             <div className="transcript-heading">
-              <div>
-                <div className="eyebrow">YOUR CONVERSATION</div>
-                <h2 id="transcript-title">Appointment help</h2>
+              <div className="transcript-title-group">
+                <span className="eyebrow">LIVE TRANSCRIPT</span>
+                <h2 id="transcript-title">Your conversation</h2>
+                <p>Everything in one place, as you talk.</p>
               </div>
-              {isPlaying && <div className="playing-indicator"><Headphones size={15} /> SPEAKING</div>}
+              <div className={`transcript-state ${isPlaying ? 'is-speaking' : isRecording ? 'is-listening' : ''}`}>
+                {isPlaying ? <Headphones size={14} /> : isRecording ? <span className="mini-pulse" /> : <span className="connection-dot" />}
+                {isPlaying ? 'Speaking' : isRecording ? 'Listening' : 'Ready'}
+              </div>
             </div>
 
-            <div className="turn-list" aria-live="polite">
+            <div className="turn-list" aria-live="polite" aria-relevant="additions text">
               {turns.length === 0 && !pending && !isRecording && !liveCaption && (
                 <div className="empty-state">
-                  <div className="empty-icon"><AudioLines size={23} /></div>
-                  <strong>We’re ready when you are</strong>
-                  <span>Ask about appointment times or leave us a message.</span>
+                  <div className="empty-illustration">
+                    <span className="empty-orbit empty-orbit-one" />
+                    <span className="empty-orbit empty-orbit-two" />
+                    <LiveOrb className="empty-orb" size={48} />
+                  </div>
+                  <strong>Your conversation starts here</strong>
+                  <span>Ask Janus about appointments, availability,<br />or finding a time that works for you.</span>
                 </div>
               )}
               {(isRecording || liveCaption) && (
                 <article className="live-caption" role="status" aria-live="polite">
-                  <div className="speaker-label live-caption-label"><span /> LIVE CAPTION</div>
-                  <p>
-                    {liveCaption
-                      || (liveCaptionSupported
-                        ? 'Listening for your words…'
-                        : 'Live captions are not supported in this browser.')}
-                  </p>
-                  <span className="live-caption-note">
-                    {liveCaptionNotice
-                      || (liveCaptionSupported
-                        ? 'Interim browser transcription; the completed turn uses the server transcript.'
-                        : 'Your final transcript will appear after you finish speaking.')}
-                  </span>
+                  <div className="speaker-label live-caption-label"><span /> YOU <small>LIVE</small></div>
+                  <p>{liveCaption || (liveCaptionSupported ? 'Listening for your words…' : 'Live captions are not supported in this browser.')}</p>
+                  <span className="live-caption-note">{liveCaptionNotice || 'Your final transcript will appear after you finish speaking.'}</span>
                 </article>
               )}
               {turns.map((turn, index) => (
                 <article className="turn" key={`${index}-${turn.user || turn.agent}`}>
-                  <div className="turn-number">{String(index + 1).padStart(2, '0')}</div>
                   <div className="turn-content">
                     {!turn.isWelcome && turn.user && (
-                      <>
-                        <div className="speaker-label user-label"><span /> YOU</div>
-                        <p>{turn.user}</p>
-                      </>
-                    )}
-                    <div className="speaker-label agent-label"><span /> {turn.isWelcome ? 'JANUS' : 'DR. MELVIN’S OFFICE'}</div>
-                    <p>{turn.agent}</p>
-                    {!turn.isWelcome && turn.toolStatus && (
-                      <div className={`tool-status ${turn.toolStatus}`}>
-                        {toolStatusLabels[turn.toolStatus] || 'Appointment details updated'}
+                      <div className="message-row user-row">
+                        <span className="message-avatar user-avatar">Y</span>
+                        <div className="message-block">
+                          <div className="message-meta"><span>You</span><small>{String(index + 1).padStart(2, '0')}</small></div>
+                          <p className="user-message">{turn.user}</p>
+                        </div>
                       </div>
                     )}
+                    <div className={`message-row agent-row ${turn.isWelcome ? 'welcome-row' : ''}`}>
+                      <span className="message-avatar agent-avatar"><LiveOrb size={27} /></span>
+                      <div className="message-block">
+                        <div className="message-meta">
+                          <span>{turn.isWelcome ? 'Janus · Assistant' : 'Dr. Melvin’s office'}</span>
+                          {turn.isWelcome && <small>WELCOME</small>}
+                        </div>
+                        <p className="agent-message">{turn.agent}</p>
+                        {!turn.isWelcome && turn.toolStatus && (
+                          <div className={`tool-status ${turn.toolStatus}`}>
+                            {toolStatusLabels[turn.toolStatus] || 'Appointment details updated'}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </article>
               ))}
               {pending && (
                 <div className="pending-line" role="status" aria-live="polite">
                   <LoaderCircle size={16} aria-hidden="true" />
-                  <span>Processing your request</span>
-                  <span className="pending-detail">Checking appointment details…</span>
+                  <span>Janus is checking the schedule<span className="thinking-dots"><i /> <i /> <i /></span></span>
                 </div>
               )}
             </div>
 
             <footer className="transcript-footer">
-              <span className="footer-dot" />
-              {connectionState === 'connected' ? 'Ready to help schedule your visit' : 'Connect when you’re ready'}
+              <span className="footer-shield"><ShieldCheck size={14} /></span>
+              <span>Your conversation is private and secure.</span>
+              <span className="transcript-count">
+                {turns.filter((turn) => !turn.isWelcome).length} {turns.filter((turn) => !turn.isWelcome).length === 1 ? 'exchange' : 'exchanges'}
+              </span>
             </footer>
           </section>
         </main>
 
         <footer className="page-footer">
-          <span>DR. MELVIN’S OFFICE</span>
-          <span>Here to help you find a convenient appointment</span>
+          <span>© DR. MELVIN’S OFFICE</span>
+          <span>Thoughtful care starts with being heard.</span>
         </footer>
       </div>
     </div>

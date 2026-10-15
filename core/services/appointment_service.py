@@ -31,6 +31,12 @@ class AppointmentService:
             if end
             else start_time + DEFAULT_APPOINTMENT_DURATION
         )
+        if start_time <= timezone.now():
+            return {
+                "ok": False,
+                "status": "invalid_time",
+                "message": "The appointment start time must be in the future.",
+            }
         if end_time <= start_time:
             return {"ok": False, "message": "The end time must be after the start time."}
 

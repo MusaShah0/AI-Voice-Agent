@@ -13,7 +13,13 @@ from django.utils import timezone
 
 from channels.db import database_sync_to_async
 
-from core.consumers import AUDIO_CHUNK_BYTES, AUDIO_SAMPLE_WIDTH, VoiceConsumer
+from core.consumers import (
+    AUDIO_CHUNK_BYTES,
+    AUDIO_SAMPLE_WIDTH,
+    FOLLOW_UP_OFFER,
+    VoiceConsumer,
+    _is_negative_closure,
+)
 from core.models import Appointment, Doctor, Reminder
 from core.reminders.service import ReminderService
 from core.services.appointment_service import AppointmentService
@@ -228,7 +234,14 @@ class DoctorVoiceConsumer(VoiceConsumer):
             parts.append("That's too close to snooze. Say okay, or tell me to move it.")
         return " ".join(parts)
 
-    async def _send_doctor_message(self, text, user_text="", tool_status=None, is_welcome=False):
+    async def _send_doctor_message(
+        self,
+        text,
+        user_text="",
+        tool_status=None,
+        is_welcome=False,
+        terminal=False,
+    ):
         text = clean_spoken_text(text)
         self.turn_counter += 1
         turn_id = self.turn_counter
@@ -257,6 +270,7 @@ class DoctorVoiceConsumer(VoiceConsumer):
             "user_transcription": user_text,
             "caption": text,
             "tool_status": tool_status,
+            "terminal": terminal,
         }))
 
     async def run_dialog_and_respond(self, user_text):
@@ -272,6 +286,8 @@ class DoctorVoiceConsumer(VoiceConsumer):
             turn_id,
         )
         response = clean_spoken_text(response)
+        if terminal:
+            response = f"{response} Goodbye."
         self.conversation_history.extend([
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": response},
@@ -280,6 +296,7 @@ class DoctorVoiceConsumer(VoiceConsumer):
             response,
             user_text=user_text,
             tool_status=tool_status,
+            terminal=terminal,
         )
         try:
             await database_sync_to_async(
@@ -291,12 +308,11 @@ class DoctorVoiceConsumer(VoiceConsumer):
             )
         except Exception:
             logger.exception("Doctor voice transcript persistence failed")
-        if terminal and settings.CALL_AUTO_HANGUP_AFTER_TERMINAL:
+        if terminal:
             await self.send(text_data=json.dumps({
                 "type": "call_ended",
                 "reason": tool_status,
             }))
-            await self.close(code=1000)
 
     def _doctor_turn(self, user_text, context, turn_id):
         text = _normalize(user_text)
@@ -521,6 +537,7 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
         }
         self.pending_action = None
         self.known_appointment_ids = set()
+        self.awaiting_goodbye = False
         greeting = (
             f"Hello {doctor.name}. I can look up your upcoming appointments by patient, "
             "date, or time, and help you cancel or reschedule one."
@@ -536,17 +553,22 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
     async def run_dialog_and_respond(self, user_text):
         turn_id = self.turn_counter + 1
         self.conversation_history.append({"role": "user", "content": user_text})
-        response, tool_status, _ = await asyncio.to_thread(
+        response, tool_status, terminal = await asyncio.to_thread(
             self._assistant_turn,
             user_text,
             turn_id,
         )
         response = clean_spoken_text(response)
+        if terminal:
+            response = f"{response} Goodbye."
+        else:
+            self.awaiting_goodbye = bool(FOLLOW_UP_OFFER.search(response))
         self.conversation_history.append({"role": "assistant", "content": response})
         await self._send_doctor_message(
             response,
             user_text=user_text,
             tool_status=tool_status,
+            terminal=terminal,
         )
         try:
             await database_sync_to_async(
@@ -558,6 +580,11 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
             )
         except Exception:
             logger.exception("Doctor assistant transcript persistence failed")
+        if terminal:
+            await self.send(text_data=json.dumps({
+                "type": "call_ended",
+                "reason": tool_status or "conversation_complete",
+            }))
 
     def _assistant_turn(self, user_text, turn_id):
         text = _normalize(user_text)
@@ -583,7 +610,8 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
                         date=True,
                     )
                     return (
-                        f"Cancelled {result['patient_name']}'s appointment on {start_display}.",
+                        f"Cancelled {result['patient_name']}'s appointment on {start_display}. "
+                        "Is there anything else I can help you with?",
                         "appointment_cancelled",
                         False,
                     )
@@ -600,7 +628,8 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
                     date=True,
                 )
                 return (
-                    f"Rescheduled {result['patient_name']} to {start_display}.",
+                    f"Rescheduled {result['patient_name']} to {start_display}. "
+                    "Is there anything else I can help you with?",
                     "appointment_rescheduled",
                     False,
                 )
@@ -608,6 +637,11 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
                 self.pending_action = None
                 return "Okay, I left the appointment unchanged.", "proposal_discarded", False
             return "Please say yes to confirm, or no to leave the appointment unchanged.", None, False
+
+        if getattr(self, "awaiting_goodbye", False) and _is_negative_closure(user_text):
+            self.awaiting_goodbye = False
+            return "Thank you.", "conversation_complete", True
+        self.awaiting_goodbye = False
 
         if self.llm.client is None:
             return "I can't reach the scheduling assistant right now. Please try again.", "error", False
@@ -624,7 +658,9 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
             "For cancellation or rescheduling, call the corresponding propose tool only after the doctor "
             "has clearly identified the exact appointment and provided any new time. The tool will ask for "
             "confirmation; never say a change is complete until the doctor confirms in a later turn and the "
-            "tool result succeeds. Interpret and speak dates in the clinic timezone. Keep spoken answers concise."
+            "tool result succeeds. After completing a request, ask, 'Is there anything else I can help you with?' "
+            "If the doctor says no or that is all, end politely. Interpret and speak dates in the clinic timezone. "
+            "Keep spoken answers concise."
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -648,7 +684,9 @@ class DoctorAssistantConsumer(DoctorVoiceConsumer):
             message = completion.choices[0].message
             tool_calls = message.tool_calls or []
             if not tool_calls:
-                return message.content or "What would you like to know about the schedule?", None, False
+                response = message.content or "What would you like to know about the schedule?"
+                self.awaiting_goodbye = bool(FOLLOW_UP_OFFER.search(response))
+                return response, None, False
 
             messages.append({
                 "role": "assistant",

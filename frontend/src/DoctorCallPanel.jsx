@@ -33,6 +33,8 @@ function DoctorCallPanel({ call, onClose, onActionComplete }) {
   const sourceRef = useRef(null)
   const processorRef = useRef(null)
   const audioSourcesRef = useRef(new Set())
+  const endingRef = useRef(false)
+  const finishTerminalCallRef = useRef(null)
   const nextPlaybackTimeRef = useRef(0)
   const receivingRef = useRef(false)
   const lifecycleRef = useRef(0)
@@ -60,13 +62,17 @@ function DoctorCallPanel({ call, onClose, onActionComplete }) {
     source.buffer = audioBuffer
     source.connect(context.destination)
     audioSourcesRef.current.add(source)
-    source.onended = () => audioSourcesRef.current.delete(source)
+    source.onended = () => {
+      audioSourcesRef.current.delete(source)
+      finishTerminalCallRef.current?.()
+    }
     const startAt = Math.max(context.currentTime + 0.02, nextPlaybackTimeRef.current)
     source.start(startAt)
     nextPlaybackTimeRef.current = startAt + audioBuffer.duration
   }, [])
 
   const stopSession = useCallback(() => {
+    endingRef.current = false
     receivingRef.current = false
     processorRef.current?.disconnect()
     sourceRef.current?.disconnect()
@@ -94,6 +100,16 @@ function DoctorCallPanel({ call, onClose, onActionComplete }) {
     setStarting(false)
     setConnected(false)
   }, [])
+
+  finishTerminalCallRef.current = () => {
+    if (!endingRef.current || audioSourcesRef.current.size > 0) return
+    endingRef.current = false
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ action: 'end_call' }))
+    }
+    stopSession()
+    onClose()
+  }
 
   useEffect(() => {
     if (cleanupTimerRef.current !== null) {
@@ -154,6 +170,8 @@ function DoctorCallPanel({ call, onClose, onActionComplete }) {
       } else if (message.type === 'call_ended') {
         setFinished(message.reason)
         receivingRef.current = false
+        endingRef.current = true
+        finishTerminalCallRef.current?.()
       } else if (message.type === 'error') {
         setError(message.message || 'The assistant could not process that request.')
         setPending(false)

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
+from django.utils import timezone
 from django.utils import timezone as django_timezone
 from groq import Groq
 
@@ -52,7 +53,7 @@ class LLMService:
             "type": "function",
             "function": {
                 "name": "check_doctor_availability",
-                "description": "Check whether Dr. Melvin is available for a date and time. If the caller gives only a start time, check a 30-minute appointment window.",
+                "description": "Check whether Dr. Melvin is available for a date and time. Before calling this tool, compare the requested start time with the current time; if it is not strictly in the future, do not check availability and tell the caller the appointment time has passed. If the caller gives only a start time, check a 30-minute appointment window.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -82,7 +83,7 @@ class LLMService:
             "type": "function",
             "function": {
                 "name": "book_appointment",
-                "description": "Book a 30-minute appointment when the caller has requested a booking and the required name, start time, and purpose are known. If the caller explicitly requests a different end time or duration, pass that end time.",
+                "description": "Book a 30-minute appointment when the caller has requested a booking and the required name, start time, and purpose are known, and the start time is strictly in the future. Do not book a past or current time. If the caller explicitly requests a different end time or duration, pass that end time.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -206,7 +207,10 @@ class LLMService:
             "back to the caller in that same clinic-local timezone. Never reinterpret a clinic-local time as UTC. "
             "Your duties:\n"
             "1. Help callers check Dr. Melvin's availability and book appointments.\n"
-            "2. New appointments are 30 minutes by default. When the caller asks to book at a specific start time, "
+            "2. Before using any scheduling tool, compare the requested start time with the current date and time above "
+            "in the clinic timezone. If it is not strictly in the future, do not call availability or booking tools; "
+            "tell the caller that time has passed and ask for a future time. New appointments are 30 minutes by default. "
+            "When the caller asks to book at a specific start time, "
             "call check_doctor_availability for that window and include every booking detail already stated, especially "
             "caller_name and purpose. If only a start time is given, check a 30-minute window; use a different duration "
             "only if explicitly requested.\n"
@@ -232,7 +236,10 @@ class LLMService:
             "8. After booking, say the appointment has been added to Dr. Melvin's clinic schedule. "
             "The connected Google Calendar belongs to the clinic, not the caller. Never claim that the "
             "appointment was added to the caller's personal calendar unless a tool confirms that.\n"
-            "9. Never output markdown asterisks, bullet lists, or formatting symbols that would sound unnatural when read aloud."
+            "9. After completing a booking, cancellation, reschedule, or appointment lookup, ask briefly, "
+            "'Is there anything else I can help you with?'. If the caller says no or that is all, the system "
+            "will thank them and end the call.\n"
+            "10. Never output markdown asterisks, bullet lists, or formatting symbols that would sound unnatural when read aloud."
         )
 
     def _remember_booking_details(
@@ -293,6 +300,14 @@ class LLMService:
         logger.info("Tool check_doctor_availability called")
         try:
             start_dt = self._parse_datetime(start_time)
+            if start_dt <= timezone.now():
+                self.booking_context.clear()
+                return {
+                    "ok": False,
+                    "available": False,
+                    "status": "invalid_time",
+                    "message": "That appointment time has passed. Please choose a future time.",
+                }
             end_dt = (
                 self._parse_datetime(end_time)
                 if end_time
@@ -682,6 +697,13 @@ class LLMService:
         logger.info("Tool book_appointment called")
         try:
             start_dt = self._parse_datetime(start_time)
+            if start_dt <= timezone.now():
+                self.booking_context.clear()
+                self.last_tool_status = "invalid_time"
+                return {
+                    "status": "invalid_time",
+                    "message": "The appointment start time must be in the future.",
+                }
             end_dt = (
                 self._parse_datetime(end_time)
                 if end_time

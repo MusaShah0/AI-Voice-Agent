@@ -41,6 +41,26 @@ WELCOME_TEXT = (
 NO_SPEECH_RESPONSE = "I didn’t catch that. Could you please repeat?"
 SENTENCE_BOUNDARY = re.compile(r'[.!?](?:["\')\]]*)\s+')
 SENTENCE_ABBREVIATIONS = {"dr.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "etc."}
+FOLLOW_UP_OFFER = re.compile(
+    r"\b(?:anything else|anything more|something else|anything further)\b",
+    re.IGNORECASE,
+)
+NEGATIVE_CLOSURE_UTTERANCES = {
+    "no",
+    "no thanks",
+    "no thank you",
+    "no thats all",
+    "thats all",
+    "that is all",
+    "nothing else",
+    "im good",
+    "all good",
+}
+
+
+def _is_negative_closure(text: str) -> bool:
+    normalized = re.sub(r"[^\w\s]", "", text.lower())
+    return re.sub(r"\s+", " ", normalized).strip() in NEGATIVE_CLOSURE_UTTERANCES
 
 
 def _resolve_vad():
@@ -69,6 +89,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         await self.accept()
         self.session_id = self.get_session_prefix() + str(self.channel_name)
         self.conversation_history = []
+        self.awaiting_goodbye = False
         self.active_task = None
         self.response_audio_active = False
         self.turn_counter = 0
@@ -395,6 +416,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
                 return
 
+            if action == "end_call":
+                await self.close(code=1000)
+                return
+
             if action == "process_text_turn":
                 user_text = data.get("text", "")
                 if user_text:
@@ -569,6 +594,11 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         }))
 
     async def run_dialog_and_respond(self, user_text: str):
+        if self.awaiting_goodbye and _is_negative_closure(user_text):
+            await self._send_terminal_goodbye(user_text)
+            return
+        self.awaiting_goodbye = False
+
         dialog_started = time.perf_counter()
         self.turn_counter += 1
         turn_id = self.turn_counter
@@ -686,6 +716,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 pass
 
         response_text = clean_spoken_text("".join(response_parts))
+        self.awaiting_goodbye = bool(FOLLOW_UP_OFFER.search(response_text))
         tool_status = self.llm.last_tool_status
         logger.info(
             "Pipeline dialog: completed session=%s response_characters=%s tool_status=%s elapsed_ms=%.2f",
@@ -730,6 +761,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 "user_transcription": user_text,
                 "caption": response_text,
                 "tool_status": tool_status,
+                "terminal": False,
             }))
             logger.info(
                 "Pipeline delivery: response sent session=%s elapsed_ms=%.2f",
@@ -738,6 +770,64 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             )
         except Exception:
             logger.exception("Pipeline delivery failed session=%s", self.session_id)
+
+    async def _send_terminal_goodbye(self, user_text: str):
+        response_text = "Thank you. Goodbye."
+        self.awaiting_goodbye = False
+        self.conversation_history.extend([
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": response_text},
+        ])
+        self.turn_counter += 1
+        turn_id = self.turn_counter
+        audio_bytes, sample_rate = await asyncio.to_thread(
+            self.tts.synthesize,
+            response_text,
+        )
+        if not audio_bytes:
+            raise RuntimeError("Piper returned no audio for the goodbye message")
+        if len(audio_bytes) % AUDIO_SAMPLE_WIDTH:
+            raise ValueError("Piper goodbye PCM output is not aligned to 16-bit samples")
+
+        self.response_audio_active = True
+        try:
+            for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
+                await self.send(text_data=json.dumps({
+                    "type": "audio_chunk",
+                    "turn_id": turn_id,
+                    "sequence": sequence,
+                    "format": "pcm_s16le",
+                    "channels": 1,
+                    "sample_rate": sample_rate,
+                    "audio_payload": base64.b64encode(
+                        audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
+                    ).decode("ascii"),
+                }))
+        finally:
+            self.response_audio_active = False
+
+        await self.send(text_data=json.dumps({
+            "type": "agent_response",
+            "turn_id": turn_id,
+            "user_transcription": user_text,
+            "caption": response_text,
+            "tool_status": None,
+            "terminal": True,
+        }))
+        try:
+            await database_sync_to_async(
+                DataRepository.save_transcript,
+                thread_sensitive=True,
+            )(
+                session_id=self.session_id,
+                full_transcript=f"User: {user_text} | Agent: {response_text}",
+            )
+        except Exception:
+            logger.exception("Pipeline goodbye transcript persistence failed")
+        await self.send(text_data=json.dumps({
+            "type": "call_ended",
+            "reason": "conversation_complete",
+        }))
 
     def _publish_dialog_stream(self, stream_queue, loop, stop_event, user_text):
         def publish(item):

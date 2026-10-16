@@ -17,7 +17,7 @@ from django.utils import timezone as django_timezone
 
 from .models import Appointment, Doctor, Reminder, ReminderEvent, Task, Transcript
 from .consumers import VoiceConsumer
-from .doc_consumers import DoctorAssistantConsumer
+from .doc_consumers import DoctorAssistantConsumer, DoctorVoiceConsumer
 from .routing import websocket_urlpatterns
 from .reminders.policy import first_fire_at, snooze_decision
 from .reminders.service import ReminderService
@@ -631,6 +631,12 @@ class DoctorDashboardTests(TransactionTestCase):
 		now = django_timezone.now()
 		self.assertTrue(snooze_decision(now, now + timedelta(minutes=16)).allowed)
 		self.assertFalse(snooze_decision(now, now + timedelta(minutes=15)).allowed)
+		self.assertTrue(
+			snooze_decision(now, now + timedelta(minutes=11), minutes=10).allowed
+		)
+		self.assertFalse(
+			snooze_decision(now, now + timedelta(minutes=10), minutes=10).allowed
+		)
 
 	@override_settings(SNOOZE_MINUTES=15, SNOOZE_MIN_BUFFER_MINUTES=1)
 	def test_snoozing_sets_next_reminder_fifteen_minutes_from_action_only(self):
@@ -671,6 +677,224 @@ class DoctorDashboardTests(TransactionTestCase):
 		self.assertEqual(appointment.start_time, original_start)
 		self.assertEqual(reminder.next_fire_at, action_time + timedelta(minutes=10))
 
+	def test_reminder_move_request_asks_for_date_and_time_without_snoozing(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 1
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		consumer._ask_doctor_model = MagicMock()
+
+		response, status, terminal = consumer._doctor_turn("move it", {}, 1)
+
+		self.assertEqual(response, "What date and time should I move the appointment to?")
+		self.assertEqual(status, "reschedule_details_needed")
+		self.assertFalse(terminal)
+		self.assertEqual(consumer.reschedule_details, "move it")
+		consumer._ask_doctor_model.assert_not_called()
+
+	def test_reminder_move_requires_a_specific_date_and_time(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 1
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		consumer._ask_doctor_model = MagicMock()
+
+		response, status, terminal = consumer._doctor_turn(
+			"move it to next week at 3 PM",
+			{},
+			1,
+		)
+
+		self.assertEqual(response, "What date and time should I move the appointment to?")
+		self.assertEqual(status, "reschedule_details_needed")
+		self.assertFalse(terminal)
+		consumer._ask_doctor_model.assert_not_called()
+
+	def test_reminder_move_collects_date_and_time_before_proposing_reschedule(self):
+		new_start = self.now + timedelta(days=1)
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 1
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+
+		def propose_reschedule(*args):
+			consumer.pending_action = {
+				"new_start_time": new_start.isoformat(),
+				"new_end_time": None,
+				"proposed_in_turn": 3,
+				"created_at": self.now,
+			}
+			return "Move it to Tuesday at 3 PM.", "reschedule_proposed", False
+
+		first_response, first_status, _ = consumer._doctor_turn("move it", {}, 1)
+		date_response, date_status, _ = consumer._doctor_turn("tomorrow", {}, 2)
+		consumer._ask_doctor_model = MagicMock(side_effect=propose_reschedule)
+		with patch(
+			"core.doc_consumers.AppointmentService.reschedule",
+			return_value={
+				"ok": True,
+				"patient_name": "Patient Example",
+				"start_time": new_start,
+			},
+		) as reschedule:
+			response, status, terminal = consumer._doctor_turn(
+				"3 PM",
+				{"appointment_id": 1, "clinic_tz": self.doctor.timezone},
+				3,
+			)
+
+		self.assertEqual(first_status, "reschedule_details_needed")
+		self.assertEqual(date_status, "reschedule_details_needed")
+		self.assertIn("What time", date_response)
+		self.assertEqual(status, "rescheduled")
+		self.assertTrue(terminal)
+		self.assertIn("now scheduled", response)
+		consumer._ask_doctor_model.assert_called_once()
+		self.assertIn("tomorrow 3 PM", consumer._ask_doctor_model.call_args.args[0])
+		self.assertIsNone(consumer.reschedule_details)
+		self.assertIsNone(consumer.pending_action)
+		reschedule.assert_called_once_with(1, new_start.isoformat(), None)
+
+	def test_reminder_acknowledged_stops_reminder(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 17
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		with patch(
+			"core.doc_consumers.ReminderService.acknowledge",
+			return_value={"ok": True},
+		) as acknowledge:
+			response, status, terminal = consumer._doctor_turn("acknowledged", {}, 1)
+
+		self.assertEqual(response, "Okay. I won't remind you again.")
+		self.assertEqual(status, "reminder_acknowledged")
+		self.assertTrue(terminal)
+		acknowledge.assert_called_once_with(17)
+
+	def test_ok_acknowledges_instead_of_confirming_pending_reschedule(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 17
+		consumer.pending_action = {
+			"new_start_time": (self.now + timedelta(days=1)).isoformat(),
+			"proposed_in_turn": 1,
+			"created_at": self.now,
+		}
+		consumer.reschedule_details = None
+		with patch(
+			"core.doc_consumers.ReminderService.acknowledge",
+			return_value={"ok": True},
+		) as acknowledge, patch(
+			"core.doc_consumers.AppointmentService.reschedule",
+		) as reschedule:
+			response, status, terminal = consumer._doctor_turn("OK", {}, 2)
+
+		self.assertEqual(response, "Okay. I won't remind you again.")
+		self.assertEqual(status, "reminder_acknowledged")
+		self.assertTrue(terminal)
+		self.assertIsNone(consumer.pending_action)
+		acknowledge.assert_called_once_with(17)
+		reschedule.assert_not_called()
+
+	def test_confirmed_reminder_reschedule_ends_the_call(self):
+		new_start = self.now + timedelta(days=1)
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 17
+		consumer.pending_action = {
+			"new_start_time": new_start.isoformat(),
+			"new_end_time": None,
+			"proposed_in_turn": 1,
+			"created_at": self.now,
+		}
+		consumer.reschedule_details = None
+		with patch(
+			"core.doc_consumers.AppointmentService.reschedule",
+			return_value={
+				"ok": True,
+				"patient_name": "Patient Example",
+				"start_time": new_start,
+			},
+		) as reschedule:
+			response, status, terminal = consumer._doctor_turn("yes", {
+				"appointment_id": 17,
+				"clinic_tz": self.doctor.timezone,
+			}, 2)
+
+		self.assertIn("now scheduled for", response)
+		self.assertEqual(status, "rescheduled")
+		self.assertTrue(terminal)
+		self.assertIsNone(consumer.pending_action)
+		reschedule.assert_called_once_with(17, new_start.isoformat(), None)
+
+	def test_reminder_snooze_duration_is_passed_to_time_left_check(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 17
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		consumer._snooze_reminder = MagicMock(
+			return_value=("Snoozed for 10 minutes.", "reminder_snoozed", True)
+		)
+
+		response, status, terminal = consumer._doctor_turn(
+			"snooze me for 10 minutes",
+			{},
+			1,
+		)
+
+		self.assertEqual(response, "Snoozed for 10 minutes.")
+		self.assertEqual(status, "reminder_snoozed")
+		self.assertTrue(terminal)
+		consumer._snooze_reminder.assert_called_once_with({}, 10)
+
+	def test_reminder_snooze_never_calls_reschedule_and_keeps_appointment_time(self):
+		appointment = self.create_appointment(
+			start_time=self.now + timedelta(hours=1),
+			end_time=self.now + timedelta(hours=1, minutes=30),
+		)
+		original_start = appointment.start_time
+		snooze_started_at = django_timezone.now()
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = reminder.pk
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		context = {
+			"patient_name": appointment.caller_name,
+			"clinic_tz": self.doctor.timezone,
+		}
+
+		with patch("core.doc_consumers.AppointmentService.reschedule") as reschedule:
+			response, status, terminal = consumer._doctor_turn(
+				"snooze for 10 minutes",
+				context,
+				1,
+			)
+
+		appointment.refresh_from_db()
+		reminder.refresh_from_db()
+		self.assertEqual(status, "reminder_snoozed")
+		self.assertTrue(terminal)
+		self.assertIn("remind you again in 10 minutes", response)
+		self.assertEqual(appointment.start_time, original_start)
+		self.assertLess(
+			abs((reminder.next_fire_at - snooze_started_at - timedelta(minutes=10)).total_seconds()),
+			2,
+		)
+		reschedule.assert_not_called()
+
+	def test_incomplete_snooze_does_not_fall_through_to_rescheduling_model(self):
+		consumer = object.__new__(DoctorVoiceConsumer)
+		consumer.reminder_id = 17
+		consumer.pending_action = None
+		consumer.reschedule_details = None
+		consumer._ask_doctor_model = MagicMock()
+
+		response, status, terminal = consumer._doctor_turn("snooze 10", {}, 1)
+
+		self.assertEqual(status, "snooze_details_needed")
+		self.assertFalse(terminal)
+		self.assertIn("number of minutes", response)
+		consumer._ask_doctor_model.assert_not_called()
+
 	def test_reminder_scheduler_claims_due_reminder_once_without_email(self):
 		appointment = self.create_appointment(start_time=self.now + timedelta(minutes=10))
 		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
@@ -709,6 +933,31 @@ class DoctorDashboardTests(TransactionTestCase):
 		)
 		self.assertEqual(assistant_token_response.status_code, 200)
 		self.assertIn("/ws/doc-assistant/?token=", assistant_token_response.json()["ws_url"])
+
+	@override_settings(DEBUG=True)
+	def test_snoozed_reminder_disappears_until_snooze_deadline(self):
+		appointment = self.create_appointment(start_time=self.now + timedelta(hours=1))
+		reminder = ReminderService.create_for_appointment(appointment, now=self.now)
+		reminder.status = Reminder.Status.SNOOZED
+		reminder.next_fire_at = self.now + timedelta(minutes=15)
+		reminder.save(update_fields=["status", "next_fire_at"])
+
+		response = self.client.get("/api/doc/reminders/active/")
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.json()["active"], [])
+
+		reminder.next_fire_at = self.now - timedelta(seconds=1)
+		reminder.save(update_fields=["next_fire_at"])
+
+		response = self.client.get("/api/doc/reminders/active/")
+
+		self.assertEqual(response.status_code, 200)
+		active = response.json()["active"]
+		self.assertEqual(len(active), 1)
+		self.assertEqual(active[0]["reminder_id"], reminder.pk)
+		self.assertEqual(active[0]["status"], Reminder.Status.ACTIVE)
+		self.assertIsNone(active[0]["next_fire_at"])
 
 	def test_appointment_service_finds_upcoming_by_patient_or_exact_time(self):
 		mike = self.create_appointment(

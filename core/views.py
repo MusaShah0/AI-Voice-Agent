@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core import signing
+from django.db.models import Q
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -70,11 +71,18 @@ def active_reminders(request):
         appointment__doctor=doctor,
         appointment__status="Scheduled",
         appointment__start_time__gt=now,
-        status__in=(Reminder.Status.ACTIVE, Reminder.Status.SNOOZED),
+    ).filter(
+        Q(status=Reminder.Status.ACTIVE)
+        | Q(status=Reminder.Status.SNOOZED, next_fire_at__lte=now)
     ).order_by("appointment__start_time")
     active = []
     for reminder in reminders:
         start_time = timezone.localtime(reminder.appointment.start_time, doctor_timezone)
+        is_snooze_due = (
+            reminder.status == Reminder.Status.SNOOZED
+            and reminder.next_fire_at is not None
+            and reminder.next_fire_at <= now
+        )
         active.append({
             "reminder_id": reminder.pk,
             "appointment_id": reminder.appointment_id,
@@ -82,10 +90,12 @@ def active_reminders(request):
             "start_time": start_time.isoformat(),
             "minutes_until_start": int((reminder.appointment.start_time - now).total_seconds() // 60),
             "attempt_count": reminder.attempt_count,
-            "status": reminder.status,
+            "status": Reminder.Status.ACTIVE if is_snooze_due else reminder.status,
             "next_fire_at": (
                 timezone.localtime(reminder.next_fire_at, doctor_timezone).isoformat()
-                if reminder.status == Reminder.Status.SNOOZED and reminder.next_fire_at
+                if reminder.status == Reminder.Status.SNOOZED
+                and not is_snooze_due
+                and reminder.next_fire_at
                 else None
             ),
         })

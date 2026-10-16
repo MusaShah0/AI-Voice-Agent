@@ -30,19 +30,40 @@ from core.views import CALL_TOKEN_SALT
 logger = logging.getLogger(__name__)
 
 
-ACKNOWLEDGE_UTTERANCES = {"ok", "okay", "got it", "alright", "thanks", "thank you", "understood"}
+ACKNOWLEDGE_UTTERANCES = {
+    "ok", "okay", "got it", "alright", "thanks", "thank you", "understood",
+    "acknowledge", "acknowledged", "no need to remind me again",
+    "stop reminding me", "you can stop reminding me",
+}
 SNOOZE_UTTERANCES = {"snooze", "snooze it", "remind me later", "later"}
+RESCHEDULE_INTENT = re.compile(r"\b(?:move|reschedule|postpone)\b", re.IGNORECASE)
+RESCHEDULE_DATE_HINT = re.compile(
+    r"\b(?:today|tomorrow|tonight|"
+    r"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?|"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b",
+    re.IGNORECASE,
+)
+RESCHEDULE_TIME_HINT = re.compile(
+    r"\b(?:at\s+)?(?:[01]?\d|2[0-3]):[0-5]\d\b|"
+    r"\b(?:at\s+)?(?:[01]?\d|2[0-3])\s*(?:a\.?m\.?|p\.?m\.?)\b|"
+    r"\bat\s+(?:[01]?\d|2[0-3])\b|\b(?:noon|midnight)\b",
+    re.IGNORECASE,
+)
 SNOOZE_REQUEST = re.compile(
     r"^(?:(?:please|can you|could you|would you|i want to|i'd like to)\s+)*"
-    r"(?:snooze(?: it| reminder| this reminder)?"
-    r"(?: for (?P<minutes>\d+) (?:minutes?|mins?))?|"
+    r"(?:snooze(?: me)?(?: it| reminder| this reminder)?"
+    r"(?: (?:for )?(?P<minutes>\d+) (?:minutes?|mins?))?|"
     r"remind me (?:again )?(?:later|in (?P<remind_minutes>\d+) (?:minutes?|mins?)))"
     r"(?: please)?$"
 )
+SNOOZE_INTENT = re.compile(r"\b(?:snooze|remind me)\b")
 SNOOZE_NEGATION = re.compile(r"\b(?:don't|do not|not|never)\s+(?:please\s+)?snooze\b")
 YES_UTTERANCES = {
     "yes", "yeah", "yes please", "confirm", "confirm it", "go ahead", "do it",
-    "please do", "okay", "ok", "sure", "correct", "thats right", "that is right",
+    "please do", "sure", "correct", "thats right", "that is right",
 }
 NO_UTTERANCES = {
     "no", "no please", "cancel that", "never mind", "keep it", "leave it unchanged",
@@ -326,45 +347,95 @@ class DoctorVoiceConsumer(VoiceConsumer):
         snooze_match = SNOOZE_REQUEST.fullmatch(text)
         if text in SNOOZE_UTTERANCES or snooze_match:
             self.pending_action = None
+            self.reschedule_details = None
             requested_minutes = None
             if snooze_match:
                 duration = snooze_match.group("minutes") or snooze_match.group("remind_minutes")
                 requested_minutes = int(duration) if duration else None
             return self._snooze_reminder(context, requested_minutes)
 
+        if SNOOZE_INTENT.search(text):
+            self.pending_action = None
+            self.reschedule_details = None
+            return (
+                "Please say snooze for a number of minutes, or just say snooze for 15 minutes.",
+                "snooze_details_needed",
+                False,
+            )
+
+        if text in ACKNOWLEDGE_UTTERANCES:
+            self.pending_action = None
+            self.reschedule_details = None
+            result = ReminderService.acknowledge(self.reminder_id)
+            return result["message"] if not result["ok"] else "Okay. I won't remind you again.", "reminder_acknowledged", True
+
         if getattr(self, "pending_action", None):
             if turn_id <= self.pending_action["proposed_in_turn"]:
                 return "Please confirm the proposed time in a new turn.", None, False
             if text in YES_UTTERANCES:
-                result = AppointmentService().reschedule(
-                    context["appointment_id"],
-                    self.pending_action["new_start_time"],
-                    self.pending_action.get("new_end_time"),
-                )
-                if not result["ok"]:
-                    self.pending_action = None
-                    return result["message"], "error", False
-                self.pending_action = None
-                start_display = _format_clinic_time(
-                    result["start_time"],
-                    context["clinic_tz"],
-                    date=True,
-                )
-                return (
-                    f"Done. {result['patient_name']} is now at {start_display}. "
-                    "The reminder has been reset.",
-                    "rescheduled",
-                    True,
-                )
+                return self._complete_reschedule(context)
             if text in NO_UTTERANCES:
                 self.pending_action = None
                 return "Okay, I left the appointment unchanged.", "proposal_discarded", False
             return "Please say yes to confirm that move, or no to leave it unchanged.", None, False
 
-        if text in ACKNOWLEDGE_UTTERANCES:
-            result = ReminderService.acknowledge(self.reminder_id)
-            return result["message"] if not result["ok"] else "Okay. I won't remind you again.", "reminder_acknowledged", True
+        if (
+            getattr(self, "reschedule_details", None)
+            or RESCHEDULE_INTENT.search(user_text)
+        ):
+            self.reschedule_details = " ".join(filter(None, (
+                getattr(self, "reschedule_details", None),
+                user_text,
+            )))
+            if not RESCHEDULE_DATE_HINT.search(self.reschedule_details):
+                return (
+                    "What date and time should I move the appointment to?",
+                    "reschedule_details_needed",
+                    False,
+                )
+            if not RESCHEDULE_TIME_HINT.search(self.reschedule_details):
+                return (
+                    "What time should I move the appointment to?",
+                    "reschedule_details_needed",
+                    False,
+                )
+            result = self._ask_doctor_model(
+                "The doctor wants to reschedule the current appointment. "
+                f"The requested new date and time are: {self.reschedule_details}",
+                context,
+                turn_id,
+            )
+            if result[1] == "reschedule_proposed":
+                self.reschedule_details = None
+                return self._complete_reschedule(context)
+            return result
+
         return self._ask_doctor_model(user_text, context, turn_id)
+
+    def _complete_reschedule(self, context):
+        action = getattr(self, "pending_action", None)
+        if action is None:
+            return "I couldn't complete the reschedule. Please try again.", "error", False
+
+        result = AppointmentService().reschedule(
+            context["appointment_id"],
+            action["new_start_time"],
+            action.get("new_end_time"),
+        )
+        self.pending_action = None
+        if not result["ok"]:
+            return result["message"], "error", False
+
+        start_display = _format_clinic_time(
+            result["start_time"],
+            context["clinic_tz"],
+            date=True,
+        )
+        return (
+            f"Done. {result['patient_name']} is now scheduled for {start_display}.",
+            "rescheduled",
+            True,
+        )
 
     def _snooze_reminder(self, context, minutes=None):
         result = ReminderService.snooze(self.reminder_id, minutes=minutes)
@@ -381,7 +452,7 @@ class DoctorVoiceConsumer(VoiceConsumer):
             return "That reminder is no longer available to snooze.", "error", False
         until = _format_clinic_time(result["until"], context["clinic_tz"])
         return (
-            f"Snoozed for {result['minutes']} minutes. I'll remind you again at {until}.",
+            f"Okay, I'll remind you again in {result['minutes']} minutes, at {until}.",
             "reminder_snoozed",
             True,
         )
@@ -405,8 +476,13 @@ class DoctorVoiceConsumer(VoiceConsumer):
             f"{context['clinic_tz']}. Current time: {now_local.isoformat()}. "
             f"Bound appointment: {context['patient_name']}, starts {start_local.isoformat()}, "
             f"purpose {context['purpose']!r}, reminder {context['reminder_status']}. "
-            "Never ask for or invent IDs. For a requested move, call propose_reschedule with an "
-            "ISO date-time in the clinic timezone; do not claim it is changed. A snooze request "
+            "Never ask for or invent IDs. For a requested move, require the doctor to provide "
+            "both a new date and time; never invent or default either value. Call "
+            "propose_reschedule with that explicit ISO date-time in the clinic timezone. The "
+            "application will immediately validate and apply the requested reschedule, then "
+            "confirm and end the reminder call; do not ask for an additional confirmation. "
+            "Do not interpret a move/reschedule request as a snooze. "
+            "A snooze request "
             f"without a duration uses {settings.SNOOZE_MINUTES} minutes. "
             "An explicitly requested whole-minute snooze duration is honored when it fits before "
             "the appointment, and snoozing never changes the appointment. "

@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 .venv/
 venv/
-env/
+.env/
 ENV/
 
 # Django and local data

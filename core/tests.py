@@ -1281,6 +1281,21 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertIn("ask only for required details that are still missing", instruction)
 		self.assertIn("caller_name and purpose", instruction)
 		self.assertIn("call cancel_appointment directly", instruction)
+		self.assertIn("Never invent or assume appointment details, availability, records, alternatives, or completed actions.", instruction)
+		self.assertIn("ask the caller what other time they would prefer", instruction)
+		self.assertIn("Do not suggest an unverified alternative.", instruction)
+		self.assertIn("ask one concise clarifying question instead of guessing", instruction)
+		self.assertIn("do not provide diagnoses or treatment advice", instruction)
+
+	def test_availability_tool_description_does_not_claim_to_find_alternatives(self):
+		availability_tool = next(
+			tool["function"]
+			for tool in LLMService.TOOL_DEFINITIONS
+			if tool["function"]["name"] == "check_doctor_availability"
+		)
+
+		self.assertIn("does not find alternative open times", availability_tool["description"])
+		self.assertIn("or check Google Calendar", availability_tool["description"])
 
 	def test_past_appointment_is_rejected_before_lookup_or_booking(self):
 		calendar = MagicMock()

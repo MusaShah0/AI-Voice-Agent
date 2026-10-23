@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import DoctorDashboard from './DoctorDashboard'
 import LiveOrb from './LiveOrb'
 import {
@@ -71,6 +71,7 @@ function PatientApp() {
     window.SpeechRecognition || window.webkitSpeechRecognition,
   ))
   const [liveCaptionNotice, setLiveCaptionNotice] = useState('')
+  const turnListRef = useRef(null)
   const socketRef = useRef(null)
   const socketPromiseRef = useRef(null)
   const socketGenerationRef = useRef(0)
@@ -95,6 +96,11 @@ function PatientApp() {
   const latestAudioTurnRef = useRef(null)
   const terminalCallPendingRef = useRef(false)
   const terminalCallEndedRef = useRef(false)
+
+  useLayoutEffect(() => {
+    const turnList = turnListRef.current
+    if (turnList) turnList.scrollTop = turnList.scrollHeight
+  }, [turns])
 
   const finishTerminalSession = () => {
     if (!terminalCallPendingRef.current || !terminalCallEndedRef.current) return
@@ -724,7 +730,7 @@ function PatientApp() {
               </div>
             </div>
 
-            <div className="turn-list" aria-live="polite" aria-relevant="additions text">
+            <div ref={turnListRef} className="turn-list" aria-live="polite" aria-relevant="additions text">
               {turns.length === 0 && !pending && !isRecording && !liveCaption && (
                 <div className="empty-state">
                   <div className="empty-illustration">

@@ -437,27 +437,6 @@
 .patient-shell.voice-speaking .orb-aura { background: radial-gradient(circle, rgb(173 210 189 / 32%) 0%, rgb(100 184 161 / 13%) 43%, transparent 72%); }
 .patient-shell.voice-thinking .orb-aura { animation-duration: 1.8s; }
 
-.patient-shell .interrupt-button {
-  position: absolute;
-  z-index: 2;
-  right: 19px;
-  bottom: 16px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 30px;
-  padding: 0 10px;
-  border: 1px solid rgb(235 246 238 / 17%);
-  border-radius: 999px;
-  color: #c4d4ca;
-  background: rgb(255 255 255 / 5%);
-  font-size: 9px;
-  cursor: pointer;
-  transition: background .2s ease, border-color .2s ease;
-}
-
-.patient-shell .interrupt-button:hover { border-color: rgb(235 246 238 / 32%); background: rgb(255 255 255 / 10%); }
-
 .patient-shell .session-actions {
   min-height: 55px;
   display: flex;

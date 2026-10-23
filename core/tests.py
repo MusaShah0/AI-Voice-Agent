@@ -3,7 +3,7 @@ import base64
 import json
 from datetime import timedelta, timezone as datetime_timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 
@@ -24,6 +24,7 @@ from .reminders.service import ReminderService
 from .reminders.sweep import claim_and_fire
 from .services.appointment_service import AppointmentService
 from .services.calendar_service import GoogleCalendarService
+from .services.vad_service import VADService
 
 
 class FakeVADService:
@@ -31,11 +32,20 @@ class FakeVADService:
 		self.call_count = 0
 		self.audio_lengths = []
 
-	def is_speech(self, audio_chunk):
+	def speech_probabilities(self, audio_chunk):
 		self.call_count += 1
 		self.audio_lengths.append(len(audio_chunk))
 		audio = np.frombuffer(audio_chunk, dtype=np.int16)
-		return bool(len(audio) and np.count_nonzero(audio) / len(audio) > 0.5)
+		return [
+			0.95 if np.count_nonzero(audio[start:start + 512]) / 512 > 0.5 else 0.05
+			for start in range(0, len(audio) - 511, 512)
+		]
+
+	def is_speech(self, audio_chunk, sampling_rate=16000, threshold=0.5):
+		return any(
+			probability >= threshold
+			for probability in self.speech_probabilities(audio_chunk)
+		)
 
 
 class FakeSTTService:
@@ -134,6 +144,22 @@ class VoiceConsumerTests(TransactionTestCase):
 			b"".join(base64.b64decode(message["audio_payload"]) for message in welcome_audio),
 			b"test audio",
 		)
+		await self.communicator.send_to(text_data=json.dumps({
+			"action": "playback_complete",
+			"turn_id": 1,
+		}))
+
+	def test_vad_service_preserves_probability_for_each_window(self):
+		probabilities = iter((0.2, 0.8, 0.6))
+		service = VADService.__new__(VADService)
+		service.model = MagicMock(
+			side_effect=lambda *_: SimpleNamespace(item=lambda: next(probabilities))
+		)
+
+		result = service.speech_probabilities(b"\x00\x00" * (512 * 3))
+
+		self.assertEqual(result, [0.2, 0.8, 0.6])
+		self.assertEqual(service.model.call_count, 3)
 
 	async def test_text_turn_returns_audio_and_saves_transcript(self):
 		await self.connect_communicator()
@@ -285,7 +311,8 @@ class VoiceConsumerTests(TransactionTestCase):
 		try:
 			with patch.object(FakeSTTService, "transcribe", return_value="."):
 				await self.communicator.send_to(bytes_data=b"\x01\x00" * 8000)
-				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11712)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 512)
 
 				processing = await self.communicator.receive_json_from(timeout=3)
 				while True:
@@ -350,13 +377,13 @@ class VoiceConsumerTests(TransactionTestCase):
 
 			with patch.object(FakeSTTService, "transcribe", return_value="snooze"), patch.object(
 				self.fake_vad,
-				"is_speech",
-				side_effect=[True, False, True, True] + [False] * 24,
+				"speech_probabilities",
+				side_effect=[[0.95], [0.05], [0.95], [0.95], [0.05] * 22],
 			):
 				for is_speech in (True, False, True, True):
 					value = b"\x01\x00" if is_speech else b"\x00\x00"
 					await communicator.send_to(bytes_data=value * 512)
-				await communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+				await communicator.send_to(bytes_data=b"\x00\x00" * 11264)
 
 				processing = await communicator.receive_json_from(timeout=3)
 				self.assertEqual(processing["type"], "processing")
@@ -425,6 +452,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			await self.communicator.send_to(bytes_data=silence_chunk)
 			self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 3200)
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 512)
 
 			processing = await self.communicator.receive_json_from(timeout=3)
 			stream_messages = []
@@ -438,7 +466,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			self.assertEqual(processing["type"], "processing")
 			self.assertEqual(response["user_transcription"], "test transcription")
 			self.assertTrue(stream_messages)
-			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 19200))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 19712))
 		finally:
 			await self.communicator.disconnect()
 
@@ -458,15 +486,15 @@ class VoiceConsumerTests(TransactionTestCase):
 		try:
 			with patch.object(
 				self.fake_vad,
-				"is_speech",
-				side_effect=[True, False, True, True] + [False] * 24,
+				"speech_probabilities",
+				side_effect=[[0.95], [0.05], [0.95], [0.95], [0.05] * 22],
 			):
 				for is_speech in (True, False, True, True):
 					value = b"\x01\x00" if is_speech else b"\x00\x00"
 					await self.communicator.send_to(bytes_data=value * 512)
 
 				self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
-				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11264)
 
 				processing = await self.communicator.receive_json_from(timeout=3)
 				while True:
@@ -503,6 +531,7 @@ class VoiceConsumerTests(TransactionTestCase):
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 8000)
 			self.assertTrue(await self.communicator.receive_nothing(timeout=0.05))
 			await self.communicator.send_to(bytes_data=b"\x00\x00" * 3200)
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 64)
 			processing = await self.communicator.receive_json_from(timeout=3)
 			while True:
 				message = await self.communicator.receive_json_from(timeout=3)
@@ -510,9 +539,9 @@ class VoiceConsumerTests(TransactionTestCase):
 					break
 
 			self.assertEqual(processing["type"], "processing")
-			self.assertEqual(self.fake_vad.call_count, 4)
+			self.assertEqual(self.fake_vad.call_count, 5)
 			self.assertTrue(all(length % 1024 == 0 for length in self.fake_vad.audio_lengths))
-			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 13248))
+			self.assertEqual(FakeSTTService.last_audio_parameters, (np.dtype(np.float32), 13312))
 		finally:
 			await self.communicator.disconnect()
 
@@ -521,7 +550,8 @@ class VoiceConsumerTests(TransactionTestCase):
 		try:
 			with patch.object(FakeSTTService, "transcribe", return_value=""):
 				await self.communicator.send_to(bytes_data=b"\x01\x00" * 8000)
-				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11200)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 11712)
+				await self.communicator.send_to(bytes_data=b"\x00\x00" * 512)
 
 				processing = await self.communicator.receive_json_from(timeout=3)
 				audio_message = await self.communicator.receive_json_from(timeout=3)
@@ -554,6 +584,136 @@ class VoiceConsumerTests(TransactionTestCase):
 				await consumer.active_task
 			except asyncio.CancelledError:
 				pass
+
+	async def test_speech_during_assistant_playback_cancels_reply_automatically(self):
+		consumer = VoiceConsumer()
+		consumer.session_id = "test-session"
+		consumer.active_task = None
+		consumer.audio_buffer = bytearray()
+		consumer.pre_speech_buffer = bytearray()
+		consumer.speech_candidate_buffer = bytearray()
+		consumer.speech_candidate_positive_bytes = 0
+		consumer.speech_candidate_confidence_window = []
+		consumer.speech_candidate_silence_bytes = 0
+		consumer.speech_detected = False
+		consumer.consecutive_silence_bytes = 0
+		consumer.speech_started_at = None
+		consumer.speech_vad_elapsed_seconds = 0.0
+		consumer.vad_remainder = bytearray()
+		consumer.vad = self.fake_vad
+		consumer.send = AsyncMock()
+		consumer.turn_counter = 4
+		consumer.response_audio_active = True
+		consumer.response_audio_turn_id = 4
+		response_task = asyncio.create_task(asyncio.sleep(30))
+		consumer.active_task = response_task
+
+		try:
+			for _ in range(6):
+				await consumer.receive(bytes_data=b"\x01\x00" * 512)
+
+			self.assertIsNone(consumer.active_task)
+			self.assertFalse(consumer.response_audio_active)
+			self.assertIsNone(consumer.response_audio_turn_id)
+			consumer.send.assert_awaited_once()
+			stopped_message = json.loads(consumer.send.await_args.kwargs["text_data"])
+			self.assertEqual(stopped_message, {"status": "audio_stopped", "turn_id": 4})
+			self.assertTrue(consumer.speech_detected)
+		finally:
+			response_task.cancel()
+			try:
+				await response_task
+			except asyncio.CancelledError:
+				pass
+
+	async def test_click_and_short_cough_do_not_interrupt_but_sustained_speech_does(self):
+		consumer = VoiceConsumer()
+		consumer.session_id = "test-session"
+		consumer.active_task = None
+		consumer.audio_buffer = bytearray()
+		consumer.pre_speech_buffer = bytearray()
+		consumer.speech_candidate_buffer = bytearray()
+		consumer.speech_candidate_positive_bytes = 0
+		consumer.speech_candidate_confidence_window = []
+		consumer.speech_candidate_silence_bytes = 0
+		consumer.speech_detected = False
+		consumer.consecutive_silence_bytes = 0
+		consumer.speech_started_at = None
+		consumer.speech_vad_elapsed_seconds = 0.0
+		consumer.vad_remainder = bytearray()
+		consumer.vad = self.fake_vad
+		consumer.send = AsyncMock()
+		consumer.turn_counter = 4
+		consumer.response_audio_active = True
+		consumer.response_audio_turn_id = 4
+
+		speech_frame = b"\x01\x00" * 512
+		silence_frame = b"\x00\x00" * 512
+		await consumer.receive(bytes_data=speech_frame)
+		for _ in range(3):
+			await consumer.receive(bytes_data=silence_frame)
+		for _ in range(4):
+			await consumer.receive(bytes_data=speech_frame)
+		for _ in range(3):
+			await consumer.receive(bytes_data=silence_frame)
+
+		self.assertTrue(consumer.response_audio_active)
+		consumer.send.assert_not_awaited()
+		self.assertFalse(consumer.speech_detected)
+
+		for _ in range(6):
+			await consumer.receive(bytes_data=speech_frame)
+
+		self.assertFalse(consumer.response_audio_active)
+		self.assertTrue(consumer.speech_detected)
+		consumer.send.assert_awaited_once()
+
+	async def test_interrupted_speech_completes_the_regular_request_response_cycle(self):
+		await self.connect_communicator()
+		try:
+			await self.communicator.send_to(text_data=json.dumps({
+				"action": "process_text_turn",
+				"text": "hello",
+			}))
+			await self.communicator.receive_json_from(timeout=3)
+			while True:
+				message = await self.communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					break
+
+			speech_frame = b"\x01\x00" * 512
+			for _ in range(8):
+				await self.communicator.send_to(bytes_data=speech_frame)
+
+			stopped = await self.communicator.receive_json_from(timeout=3)
+			self.assertEqual(stopped["status"], "audio_stopped")
+
+			await self.communicator.send_to(bytes_data=b"\x00\x00" * 11264)
+			processing = await self.communicator.receive_json_from(timeout=3)
+			self.assertEqual(processing["type"], "processing")
+			while True:
+				message = await self.communicator.receive_json_from(timeout=3)
+				if message["type"] == "agent_response":
+					break
+
+			self.assertEqual(message["user_transcription"], "test transcription")
+			self.assertEqual(message["caption"], "Dr. Melvin is available. Would you like to book?")
+		finally:
+			await self.communicator.disconnect()
+
+	async def test_playback_complete_releases_backend_vad_gate(self):
+		consumer = VoiceConsumer()
+		consumer.session_id = "test-session"
+		consumer.response_audio_active = True
+		consumer.response_audio_turn_id = 4
+
+		await consumer.receive(text_data=json.dumps({
+			"action": "playback_complete",
+			"turn_id": 4,
+		}))
+
+		self.assertFalse(consumer.response_audio_active)
+		self.assertIsNone(consumer.response_audio_turn_id)
 
 
 

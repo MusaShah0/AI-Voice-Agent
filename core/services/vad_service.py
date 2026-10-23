@@ -24,13 +24,19 @@ class VADService:
         Determines whether the provided PCM-16 audio chunk contains active speech.
         Evaluates 512-sample (32ms at 16kHz) windows using Silero VAD.
         """
-        if not audio_chunk or len(audio_chunk) < 2:
-            return False
+        return any(
+            probability >= threshold
+            for probability in self.speech_probabilities(audio_chunk, sampling_rate)
+        )
 
-        # Convert raw PCM-16 bytes into normalized float32 numpy array cleanly
+    def speech_probabilities(self, audio_chunk: bytes, sampling_rate: int = 16000) -> list[float]:
+        """Return Silero's speech probability for each 32ms audio window."""
+        if not audio_chunk or len(audio_chunk) < 2:
+            return []
+
         audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
         if len(audio_int16) == 0:
-            return False
+            return []
 
         audio_float = audio_int16.astype(np.float32) / 32768.0
         tensor = torch.from_numpy(audio_float)
@@ -39,17 +45,13 @@ class VADService:
         if len(tensor) < window_size:
             padded = torch.zeros(window_size, dtype=torch.float32)
             padded[:len(tensor)] = tensor
-            prob = self.model(padded, sampling_rate).item()
-            return prob >= threshold
+            return [self.model(padded, sampling_rate).item()]
 
-        # Check slices of window_size across the chunk
+        probabilities = []
         for start_idx in range(0, len(tensor) - window_size + 1, window_size):
             slice_tensor = tensor[start_idx:start_idx + window_size]
-            prob = self.model(slice_tensor, sampling_rate).item()
-            if prob >= threshold:
-                return True
-
-        return False
+            probabilities.append(self.model(slice_tensor, sampling_rate).item())
+        return probabilities
 
 
 def get_vad_service() -> VADService:

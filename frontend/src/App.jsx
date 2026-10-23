@@ -5,7 +5,6 @@ import {
   CircleHelp,
   Headphones,
   LoaderCircle,
-  Mic,
   Send,
   ShieldCheck,
   Wifi,
@@ -147,6 +146,16 @@ function PatientApp() {
 
   const finishPlaybackIfReady = () => {
     if (playbackCompleteRef.current && playbackSourcesRef.current.size === 0) {
+      const completedTurnId = playbackTurnRef.current
+      if (
+        Number.isInteger(completedTurnId)
+        && socketRef.current?.readyState === WebSocket.OPEN
+      ) {
+        socketRef.current.send(JSON.stringify({
+          action: 'playback_complete',
+          turn_id: completedTurnId,
+        }))
+      }
       if (playbackContextRef.current && playbackContextRef.current.state !== 'closed') {
         playbackContextRef.current.close()
       }
@@ -553,7 +562,7 @@ function PatientApp() {
         if (
           socket.readyState === WebSocket.OPEN
           && recordingRef.current
-          && !inputSuppressedRef.current
+          && (!inputSuppressedRef.current || playbackTurnRef.current !== null)
         ) {
           const pcm = context.sampleRate === TARGET_SAMPLE_RATE
             ? pcm16AtTargetRateFromFloat(input)
@@ -591,14 +600,6 @@ function PatientApp() {
     setConnectionState('disconnected')
   }
 
-  const interrupt = () => {
-    if (recordingRef.current) {
-      stopAgentPlayback()
-      return
-    }
-    void startMicrophone()
-  }
-
   const sendTextTurn = async (event) => {
     event.preventDefault()
     const text = draft.trim()
@@ -633,7 +634,7 @@ function PatientApp() {
   const voiceInstruction = pending
     ? 'Checking the schedule and preparing a response.'
     : isPlaying
-      ? 'You can interrupt the reply at any time.'
+      ? 'Speak naturally to interrupt; no button is needed.'
       : isRecording
         ? 'Tell us what you need, then tap the button to finish.'
         : ''
@@ -661,9 +662,9 @@ function PatientApp() {
                   className={`mic-button ${isRecording ? 'is-recording' : ''}`}
                   type="button"
                   onClick={isRecording ? () => stopMicrophone() : startMicrophone}
-                  disabled={!isRecording && (connectionState === 'connecting' || pending || isPlaying)}
-                  aria-label={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
-                  title={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
+                  disabled={pending || isPlaying || (!isRecording && connectionState === 'connecting')}
+                  aria-label={isPlaying && isRecording ? 'Listening for interruption' : isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
+                  title={isPlaying && isRecording ? 'Listening for interruption' : isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
                 >
                   <LiveOrb size="100%" interactive />
                 </button>
@@ -677,11 +678,6 @@ function PatientApp() {
                   ))}
                 </div>
               </div>
-              {isPlaying && (
-                <button className="interrupt-button" type="button" onClick={interrupt}>
-                  <Mic size={13} /> Interrupt &amp; talk
-                </button>
-              )}
             </div>
 
             {connectionState !== 'disconnected' && (

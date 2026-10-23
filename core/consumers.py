@@ -25,6 +25,9 @@ AUDIO_SAMPLE_WIDTH = 2
 VAD_WINDOW_BYTES = 512 * AUDIO_SAMPLE_WIDTH
 SPEECH_CONFIRMATION_BYTES = 3 * VAD_WINDOW_BYTES
 SPEECH_CANDIDATE_MAX_GAP_BYTES = 2 * VAD_WINDOW_BYTES
+BARGE_IN_CONFIDENCE = 0.75
+BARGE_IN_CONFIRMATION_FRAMES = 6
+BARGE_IN_WINDOW_FRAMES = 8
 BYTES_PER_MS = (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH) // 1000  # 32 bytes/ms
 
 # VAD Endpointing & Buffering Parameters
@@ -92,6 +95,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.awaiting_goodbye = False
         self.active_task = None
         self.response_audio_active = False
+        self.response_audio_turn_id = None
         self.turn_counter = 0
 
         # Audio buffering & speech state
@@ -99,6 +103,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         self.pre_speech_buffer = bytearray()
         self.speech_candidate_buffer = bytearray()
         self.speech_candidate_positive_bytes = 0
+        self.speech_candidate_confidence_window = []
         self.speech_candidate_silence_bytes = 0
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
@@ -171,6 +176,8 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         if len(audio_bytes) % AUDIO_SAMPLE_WIDTH:
             raise ValueError("Piper welcome PCM output is not aligned to 16-bit samples")
 
+        self.response_audio_active = True
+        self.response_audio_turn_id = self.turn_counter
         for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
             audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
             await self.send(text_data=json.dumps({
@@ -225,10 +232,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
 
             vad_started_at = time.perf_counter()
             try:
-                has_speech = (
-                    await asyncio.to_thread(self.vad.is_speech, vad_audio)
+                speech_probabilities = (
+                    await asyncio.to_thread(self.vad.speech_probabilities, vad_audio)
                     if vad_audio
-                    else False
+                    else []
                 )
             except Exception:
                 logger.exception(
@@ -245,124 +252,20 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             ):
                 return
 
-            speech_just_confirmed = False
-            if not self.speech_detected:
-                if has_speech:
-                    self.speech_candidate_buffer.extend(clean_chunk)
-                    self.speech_candidate_positive_bytes += len(vad_audio)
-                    self.speech_candidate_silence_bytes = 0
-                elif self.speech_candidate_buffer:
-                    self.speech_candidate_buffer.extend(clean_chunk)
-                    self.speech_candidate_silence_bytes += len(clean_chunk)
-                    if self.speech_candidate_silence_bytes > SPEECH_CANDIDATE_MAX_GAP_BYTES:
-                        self.pre_speech_buffer.extend(self.speech_candidate_buffer)
-                        if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
-                            del self.pre_speech_buffer[:-PRE_SPEECH_BUFFER_BYTES]
-                        self.speech_candidate_buffer.clear()
-                        self.speech_candidate_positive_bytes = 0
-                        self.speech_candidate_silence_bytes = 0
+            if len(speech_probabilities) != len(vad_audio) // VAD_WINDOW_BYTES:
+                raise RuntimeError("VAD returned a mismatched number of window probabilities")
+
+            per_frame_vad_time = vad_elapsed / max(1, len(speech_probabilities))
+            for index, probability in enumerate(speech_probabilities):
+                frame_start = index * VAD_WINDOW_BYTES
+                audio_frame = vad_audio[frame_start:frame_start + VAD_WINDOW_BYTES]
+                task_started = await self._process_vad_frame(
+                    audio_frame,
+                    probability,
+                    per_frame_vad_time,
+                )
+                if task_started:
                     return
-
-                if (
-                    self.speech_candidate_buffer
-                    and self.speech_candidate_positive_bytes < SPEECH_CONFIRMATION_BYTES
-                ):
-                    return
-                speech_just_confirmed = bool(self.speech_candidate_buffer)
-
-            if self.speech_detected or has_speech:
-                self.speech_vad_elapsed_seconds += vad_elapsed
-
-            if has_speech:
-                # Only cancel a turn while response audio is actively being sent.
-                if (
-                    self.active_task
-                    and not self.active_task.done()
-                    and self.response_audio_active
-                ):
-                    logger.info("User interrupted active turn in session %s", self.session_id)
-                    self.active_task.cancel()
-                    self.active_task = None
-                    await self.send(text_data=json.dumps({
-                        "status": "audio_stopped",
-                        "turn_id": self.turn_counter,
-                    }))
-
-                # 2. Transition into speech-detected state
-                if not self.speech_detected:
-                    self.speech_detected = True
-                    self.speech_started_at = vad_started_at
-                    self.audio_buffer.extend(self.pre_speech_buffer)
-                    logger.info(
-                        "Pipeline VAD: speech started session=%s pre_speech_bytes=%s",
-                        self.session_id,
-                        len(self.pre_speech_buffer),
-                    )
-                    self.audio_buffer.extend(self.speech_candidate_buffer)
-                    self.speech_candidate_buffer.clear()
-                    self.speech_candidate_positive_bytes = 0
-                    self.speech_candidate_silence_bytes = 0
-                    self.pre_speech_buffer.clear()
-
-                self.consecutive_silence_bytes = 0
-                if not speech_just_confirmed:
-                    self.audio_buffer.extend(clean_chunk)
-
-                # 3. Maximum speech duration safeguard
-                if len(self.audio_buffer) >= MAX_SPEECH_BYTES:
-                    audio_data = bytes(self.audio_buffer)
-                    logger.info(
-                        "Pipeline endpoint: maximum utterance reached session=%s audio_bytes=%s",
-                        self.session_id,
-                        len(audio_data),
-                    )
-                    self._log_voice_endpoint_timing()
-                    self._reset_speech_state()
-                    if not await self._start_task(
-                        self.process_audio_pipeline(audio_data),
-                        source="voice-max-duration",
-                    ):
-                        await self._send_busy()
-
-            else:
-                if self.speech_detected:
-                    # User was speaking; accumulating silence pause
-                    self.audio_buffer.extend(clean_chunk)
-                    self.consecutive_silence_bytes += len(clean_chunk)
-
-                    # 4. Silence endpoint detected (user finished speaking)
-                    if self.consecutive_silence_bytes >= SILENCE_THRESHOLD_BYTES:
-                        if len(self.audio_buffer) >= MIN_SPEECH_BYTES:
-                            audio_data = bytes(self.audio_buffer)
-                            logger.info(
-                                "Pipeline endpoint: silence threshold reached session=%s audio_bytes=%s silence_ms=%s",
-                                self.session_id,
-                                len(audio_data),
-                                SILENCE_THRESHOLD_MS,
-                            )
-                            self._log_voice_endpoint_timing()
-                            self._reset_speech_state()
-                            if not await self._start_task(
-                                self.process_audio_pipeline(audio_data),
-                                source="voice-silence-endpoint",
-                            ):
-                                await self._send_busy()
-                        else:
-                            # Transient noise pop; discard
-                            logger.info(
-                                "Pipeline endpoint: discarded short audio session=%s audio_bytes=%s",
-                                self.session_id,
-                                len(self.audio_buffer),
-                            )
-                            self._reset_speech_state()
-                else:
-                    self.speech_candidate_buffer.clear()
-                    self.speech_candidate_positive_bytes = 0
-                    self.speech_candidate_silence_bytes = 0
-                    # Ambient background before speech: maintain rolling pre-speech buffer
-                    self.pre_speech_buffer.extend(clean_chunk)
-                    if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
-                        del self.pre_speech_buffer[:-PRE_SPEECH_BUFFER_BYTES]
 
         elif text_data:
             try:
@@ -375,16 +278,24 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             action = data.get("action")
             logger.info("Pipeline receive: action=%s session=%s", action, self.session_id)
 
+            if action == "playback_complete":
+                if data.get("turn_id") == self.response_audio_turn_id:
+                    self.response_audio_active = False
+                    self.response_audio_turn_id = None
+                return
+
             if action == "stop_audio":
                 stopped_turn_id = (
-                    self.turn_counter
-                    if self.active_task and not self.active_task.done()
+                    self.response_audio_turn_id
+                    if self.response_audio_active
                     else None
                 )
                 if self.active_task and not self.active_task.done():
                     logger.info("Pipeline stop: cancelling active turn session=%s", self.session_id)
                     self.active_task.cancel()
                 self.active_task = None
+                self.response_audio_active = False
+                self.response_audio_turn_id = None
 
                 await self.send(text_data=json.dumps({
                     "status": "audio_stopped",
@@ -438,16 +349,161 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             elif action != "stop_audio":
                 logger.warning("Pipeline receive: unknown action=%s session=%s", action, self.session_id)
 
+    async def _process_vad_frame(self, audio_frame, probability, vad_elapsed):
+        has_speech = probability >= 0.5
+        speech_just_confirmed = False
+
+        if not self.speech_detected:
+            if has_speech:
+                self.speech_candidate_buffer.extend(audio_frame)
+                self.speech_candidate_positive_bytes += len(audio_frame)
+                self.speech_candidate_confidence_window.append(
+                    probability >= BARGE_IN_CONFIDENCE
+                )
+                self.speech_candidate_confidence_window = (
+                    self.speech_candidate_confidence_window[-BARGE_IN_WINDOW_FRAMES:]
+                )
+                if len(self.speech_candidate_buffer) > PRE_SPEECH_BUFFER_BYTES:
+                    del self.speech_candidate_buffer[:-PRE_SPEECH_BUFFER_BYTES]
+                self.speech_candidate_silence_bytes = 0
+            elif self.speech_candidate_buffer:
+                self.speech_candidate_buffer.extend(audio_frame)
+                self.speech_candidate_confidence_window.append(False)
+                self.speech_candidate_confidence_window = (
+                    self.speech_candidate_confidence_window[-BARGE_IN_WINDOW_FRAMES:]
+                )
+                self.speech_candidate_silence_bytes += len(audio_frame)
+                if self.speech_candidate_silence_bytes > SPEECH_CANDIDATE_MAX_GAP_BYTES:
+                    self.pre_speech_buffer.extend(self.speech_candidate_buffer)
+                    if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
+                        del self.pre_speech_buffer[:-PRE_SPEECH_BUFFER_BYTES]
+                    self.speech_candidate_buffer.clear()
+                    self.speech_candidate_positive_bytes = 0
+                    self.speech_candidate_confidence_window.clear()
+                    self.speech_candidate_silence_bytes = 0
+                return False
+
+            if (
+                self.speech_candidate_buffer
+                and (
+                    self.speech_candidate_positive_bytes < SPEECH_CONFIRMATION_BYTES
+                    or (
+                        self.response_audio_active
+                        and sum(self.speech_candidate_confidence_window)
+                        < BARGE_IN_CONFIRMATION_FRAMES
+                    )
+                )
+            ):
+                return False
+            speech_just_confirmed = bool(self.speech_candidate_buffer)
+
+        if self.speech_detected or has_speech:
+            self.speech_vad_elapsed_seconds += vad_elapsed
+
+        if has_speech:
+            if self.response_audio_active:
+                logger.info("User interrupted active turn in session %s", self.session_id)
+                interrupted_turn_id = self.response_audio_turn_id
+                if self.active_task and not self.active_task.done():
+                    self.active_task.cancel()
+                self.active_task = None
+                self.response_audio_active = False
+                self.response_audio_turn_id = None
+                await self.send(text_data=json.dumps({
+                    "status": "audio_stopped",
+                    "turn_id": interrupted_turn_id,
+                }))
+
+            if not self.speech_detected:
+                self.speech_detected = True
+                self.speech_started_at = time.perf_counter()
+                self.audio_buffer.extend(self.pre_speech_buffer)
+                logger.info(
+                    "Pipeline VAD: speech started session=%s pre_speech_bytes=%s",
+                    self.session_id,
+                    len(self.pre_speech_buffer),
+                )
+                self.audio_buffer.extend(self.speech_candidate_buffer)
+                self.speech_candidate_buffer.clear()
+                self.speech_candidate_positive_bytes = 0
+                self.speech_candidate_confidence_window.clear()
+                self.speech_candidate_silence_bytes = 0
+                self.pre_speech_buffer.clear()
+
+            self.consecutive_silence_bytes = 0
+            if not speech_just_confirmed:
+                self.audio_buffer.extend(audio_frame)
+
+            if len(self.audio_buffer) >= MAX_SPEECH_BYTES:
+                self.audio_buffer.extend(self.vad_remainder)
+                self.vad_remainder.clear()
+                audio_data = bytes(self.audio_buffer)
+                logger.info(
+                    "Pipeline endpoint: maximum utterance reached session=%s audio_bytes=%s",
+                    self.session_id,
+                    len(audio_data),
+                )
+                self._log_voice_endpoint_timing()
+                self._reset_speech_state()
+                if not await self._start_task(
+                    self.process_audio_pipeline(audio_data),
+                    source="voice-max-duration",
+                ):
+                    await self._send_busy()
+                return True
+        elif self.speech_detected:
+            self.audio_buffer.extend(audio_frame)
+            self.consecutive_silence_bytes += len(audio_frame)
+
+            if self.consecutive_silence_bytes >= SILENCE_THRESHOLD_BYTES:
+                self.audio_buffer.extend(self.vad_remainder)
+                self.vad_remainder.clear()
+                if len(self.audio_buffer) >= MIN_SPEECH_BYTES:
+                    audio_data = bytes(self.audio_buffer)
+                    logger.info(
+                        "Pipeline endpoint: silence threshold reached session=%s audio_bytes=%s silence_ms=%s",
+                        self.session_id,
+                        len(audio_data),
+                        SILENCE_THRESHOLD_MS,
+                    )
+                    self._log_voice_endpoint_timing()
+                    self._reset_speech_state()
+                    if not await self._start_task(
+                        self.process_audio_pipeline(audio_data),
+                        source="voice-silence-endpoint",
+                    ):
+                        await self._send_busy()
+                else:
+                    logger.info(
+                        "Pipeline endpoint: discarded short audio session=%s audio_bytes=%s",
+                        self.session_id,
+                        len(self.audio_buffer),
+                    )
+                    self._reset_speech_state()
+                return True
+        else:
+            self.speech_candidate_buffer.clear()
+            self.speech_candidate_positive_bytes = 0
+            self.speech_candidate_confidence_window.clear()
+            self.speech_candidate_silence_bytes = 0
+            self.pre_speech_buffer.extend(audio_frame)
+            if len(self.pre_speech_buffer) > PRE_SPEECH_BUFFER_BYTES:
+                del self.pre_speech_buffer[:-PRE_SPEECH_BUFFER_BYTES]
+
+        return False
+
     def _reset_speech_state(self):
         self.audio_buffer.clear()
         self.pre_speech_buffer.clear()
         self.speech_candidate_buffer.clear()
         self.speech_candidate_positive_bytes = 0
+        self.speech_candidate_confidence_window.clear()
         self.speech_candidate_silence_bytes = 0
         self.speech_detected = False
         self.consecutive_silence_bytes = 0
         self.speech_started_at = None
         self.speech_vad_elapsed_seconds = 0.0
+        self.vad_remainder.clear()
 
     def _log_voice_endpoint_timing(self):
         if self.speech_started_at is None:
@@ -486,10 +542,14 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         try:
             await coroutine
         except asyncio.CancelledError:
+            self.response_audio_active = False
+            self.response_audio_turn_id = None
             outcome = "cancelled"
             logger.info("Pipeline turn: task cancelled session=%s", self.session_id)
             raise
         except Exception:
+            self.response_audio_active = False
+            self.response_audio_turn_id = None
             outcome = "failed"
             logger.exception("Pipeline turn failed session=%s", self.session_id)
             await self.send(text_data=json.dumps({
@@ -570,6 +630,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             raise ValueError("Piper retry prompt PCM output is not aligned to 16-bit samples")
 
         self.response_audio_active = True
+        self.response_audio_turn_id = turn_id
         try:
             for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
                 audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
@@ -582,8 +643,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                     "sample_rate": sample_rate,
                     "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
                 }))
-        finally:
+        except Exception:
             self.response_audio_active = False
+            self.response_audio_turn_id = None
+            raise
 
         await self.send(text_data=json.dumps({
             "type": "agent_response",
@@ -648,25 +711,23 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                 raise ValueError("Piper PCM output is not aligned to 16-bit samples")
 
             self.response_audio_active = True
-            try:
-                for offset in range(0, len(audio_bytes), AUDIO_CHUNK_BYTES):
-                    audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
-                    if len(audio_chunk) % AUDIO_SAMPLE_WIDTH:
-                        audio_chunk = audio_chunk[:-1]
-                    if not audio_chunk:
-                        continue
-                    await self.send(text_data=json.dumps({
-                        "type": "audio_chunk",
-                        "turn_id": turn_id,
-                        "sequence": sequence,
-                        "format": "pcm_s16le",
-                        "channels": 1,
-                        "sample_rate": sample_rate,
-                        "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
-                    }))
-                    sequence += 1
-            finally:
-                self.response_audio_active = False
+            self.response_audio_turn_id = turn_id
+            for offset in range(0, len(audio_bytes), AUDIO_CHUNK_BYTES):
+                audio_chunk = audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
+                if len(audio_chunk) % AUDIO_SAMPLE_WIDTH:
+                    audio_chunk = audio_chunk[:-1]
+                if not audio_chunk:
+                    continue
+                await self.send(text_data=json.dumps({
+                    "type": "audio_chunk",
+                    "turn_id": turn_id,
+                    "sequence": sequence,
+                    "format": "pcm_s16le",
+                    "channels": 1,
+                    "sample_rate": sample_rate,
+                    "audio_payload": base64.b64encode(audio_chunk).decode("ascii"),
+                }))
+                sequence += 1
 
             logger.info(
                 "Pipeline TTS: sentence synthesized session=%s turn=%s audio_bytes=%s elapsed_ms=%.2f",
@@ -790,6 +851,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
             raise ValueError("Piper goodbye PCM output is not aligned to 16-bit samples")
 
         self.response_audio_active = True
+        self.response_audio_turn_id = turn_id
         try:
             for sequence, offset in enumerate(range(0, len(audio_bytes), AUDIO_CHUNK_BYTES)):
                 await self.send(text_data=json.dumps({
@@ -803,8 +865,10 @@ class VoiceConsumer(AsyncWebsocketConsumer):
                         audio_bytes[offset:offset + AUDIO_CHUNK_BYTES]
                     ).decode("ascii"),
                 }))
-        finally:
+        except Exception:
             self.response_audio_active = False
+            self.response_audio_turn_id = None
+            raise
 
         await self.send(text_data=json.dumps({
             "type": "agent_response",

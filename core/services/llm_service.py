@@ -251,9 +251,11 @@ class LLMService:
             "omit it and preserve the appointment's existing duration. "
             "Do not claim the change succeeded unless that tool returns status updated.\n"
             "7. Always keep your verbal responses concise, warm, natural, and conversational for voice output.\n"
-            "8. After booking, say the appointment has been added to Dr. Melvin's clinic schedule only if the booking tool "
-            "confirms success. The connected Google Calendar belongs to the clinic, not the caller. Never claim that the "
-            "appointment was added to the caller's personal calendar unless a tool confirms that.\n"
+            "8. After booking, say the appointment was added to Dr. Melvin's Google Calendar only if the booking tool "
+            "returns google_calendar_synced true. If it is false, confirm only that the appointment was recorded in the "
+            "clinic scheduling system; do not mention Google Calendar sync or claim the event was added to any calendar. "
+            "The connected Google Calendar belongs to the clinic, not the caller. Never claim that the appointment was "
+            "added to the caller's personal calendar unless a tool confirms that.\n"
             "9. After completing a booking, cancellation, reschedule, or appointment lookup, ask briefly, "
             "'Is there anything else I can help you with?'. If the caller says no or that is all, the system "
             "will thank them and end the call.\n"
@@ -737,6 +739,7 @@ class LLMService:
             }
 
         google_event_id = None
+        calendar_sync_error = None
 
         # 1. Sync to Google Calendar if authenticated
         try:
@@ -749,8 +752,18 @@ class LLMService:
                     caller_name=caller_name
                 )
                 google_event_id = event_data.get("id")
+                if not google_event_id:
+                    calendar_sync_error = "Google Calendar returned no event ID"
+            else:
+                calendar_sync_error = "Google Calendar is not authenticated"
         except Exception as cal_err:
-            logger.warning("Failed to add event to Google Calendar: %s", cal_err)
+            calendar_sync_error = str(cal_err)
+
+        if calendar_sync_error:
+            logger.warning(
+                "Google Calendar sync failed; appointment will be saved locally only: %s",
+                calendar_sync_error,
+            )
 
         # 2. Persist Appointment to Database
         try:
@@ -762,7 +775,10 @@ class LLMService:
                 google_event_id=google_event_id,
             )
 
-            self.last_tool_status = "calendar_booked"
+            calendar_synced = bool(google_event_id)
+            self.last_tool_status = (
+                "calendar_booked" if calendar_synced else "calendar_sync_failed"
+            )
             self.booking_context.clear()
             return {
                 "status": "confirmed",
@@ -771,7 +787,12 @@ class LLMService:
                 "start_time": start_dt.strftime("%A, %B %d at %I:%M %p"),
                 "end_time": end_dt.strftime("%I:%M %p"),
                 "purpose": purpose,
-                "google_calendar_synced": bool(google_event_id)
+                "google_calendar_synced": calendar_synced,
+                "message": (
+                    "Appointment confirmed and added to Google Calendar."
+                    if calendar_synced
+                    else "Appointment confirmed in the clinic scheduling system."
+                ),
             }
         except Exception as db_err:
             logger.exception("Database error while booking appointment: %s", db_err)

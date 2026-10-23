@@ -1472,11 +1472,14 @@ class LLMServiceToolsTests(TransactionTestCase):
 		mock_cal.is_authenticated.return_value = True
 		mock_cal.create_event.return_value = {"id": "google-event-123"}
 		llm = LLMService(calendar_service=mock_cal)
+		start_time = django_timezone.localtime(
+			django_timezone.now() + timedelta(days=2)
+		).replace(hour=10, minute=0, second=0, microsecond=0)
 
 		result = llm.book_appointment(
 			caller_name="John Doe",
-			start_time="2026-10-16 10:00:00",
-			end_time="2026-10-16 10:30:00",
+			start_time=start_time.isoformat(),
+			end_time=(start_time + timedelta(minutes=30)).isoformat(),
 			purpose="General Consultation"
 		)
 
@@ -1485,14 +1488,17 @@ class LLMServiceToolsTests(TransactionTestCase):
 		self.assertEqual(llm.last_tool_status, "calendar_booked")
 		self.assertTrue(result["google_calendar_synced"])
 		calendar_start = mock_cal.create_event.call_args.kwargs["start_time"]
-		self.assertEqual(calendar_start.isoformat(), "2026-10-16T10:00:00+05:00")
+		self.assertEqual(calendar_start, start_time)
 
 		# Verify DB records
 		app = Appointment.objects.get(id=result["appointment_id"])
 		self.assertEqual(app.caller_name, "John Doe")
 		self.assertEqual(app.purpose, "General Consultation")
-		self.assertEqual(app.start_time, llm._parse_datetime("2026-10-16 10:00:00"))
-		self.assertEqual(result["start_time"], "Friday, October 16 at 10:00 AM")
+		self.assertEqual(app.start_time, start_time)
+		self.assertEqual(
+			result["start_time"],
+			start_time.strftime("%A, %B %d at %I:%M %p"),
+		)
 
 		self.assertFalse(Task.objects.filter(appointment=app).exists())
 		self.assertEqual(app.google_event_id, "google-event-123")
@@ -1504,18 +1510,42 @@ class LLMServiceToolsTests(TransactionTestCase):
 
 		result = llm.book_appointment(
 			caller_name="Mike Smith",
-			start_time="2026-10-16 23:00:00",
+			start_time=(django_timezone.now() + timedelta(days=2)).isoformat(),
 			purpose="Checkup",
 		)
 
 		self.assertEqual(result["status"], "confirmed")
-		self.assertEqual(result["start_time"], "Friday, October 16 at 11:00 PM")
-		self.assertEqual(result["end_time"], "11:30 PM")
+		self.assertFalse(result["google_calendar_synced"])
+		self.assertEqual(llm.last_tool_status, "calendar_sync_failed")
+		self.assertIn("confirmed in the clinic scheduling system", result["message"])
+		self.assertNotIn("Google Calendar", result["message"])
+		self.assertFalse(mock_cal.create_event.called)
 		appointment = Appointment.objects.get(pk=result["appointment_id"])
 		self.assertEqual(
 			appointment.end_time - appointment.start_time,
 			timedelta(minutes=30),
 		)
+		self.assertIsNone(appointment.google_event_id)
+
+	def test_book_appointment_reports_calendar_sync_exception(self):
+		mock_cal = MagicMock()
+		mock_cal.is_authenticated.return_value = True
+		mock_cal.create_event.side_effect = RuntimeError("Calendar API unavailable")
+		llm = LLMService(calendar_service=mock_cal)
+
+		result = llm.book_appointment(
+			caller_name="Mike Smith",
+			start_time=(django_timezone.now() + timedelta(days=2)).isoformat(),
+			purpose="Checkup",
+		)
+
+		self.assertEqual(result["status"], "confirmed")
+		self.assertFalse(result["google_calendar_synced"])
+		self.assertEqual(llm.last_tool_status, "calendar_sync_failed")
+		self.assertIn("confirmed in the clinic scheduling system", result["message"])
+		self.assertNotIn("Google Calendar", result["message"])
+		appointment = Appointment.objects.get(pk=result["appointment_id"])
+		self.assertIsNone(appointment.google_event_id)
 
 	def test_availability_defaults_to_thirty_minute_window(self):
 		llm = LLMService(calendar_service=MagicMock())

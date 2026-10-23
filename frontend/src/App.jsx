@@ -772,7 +772,7 @@ function PatientApp() {
                           {turn.isWelcome && <small>WELCOME</small>}
                         </div>
                         <p className="agent-message">{turn.agent}</p>
-                        {!turn.isWelcome && turn.toolStatus && (
+                        {!turn.isWelcome && turn.toolStatus && turn.toolStatus !== 'calendar_sync_failed' && (
                           <div className={`tool-status ${turn.toolStatus}`}>
                             {toolStatusLabels[turn.toolStatus] || 'Appointment details updated'}
                           </div>

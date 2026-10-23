@@ -25,11 +25,18 @@
 .patient-shell.app-shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .patient-shell .app-main {
   width: 100%;
   max-width: 1580px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   margin: 0 auto;
   padding: 0 clamp(25px, 5.3vw, 82px);
@@ -115,12 +122,14 @@
 .patient-shell .connecting .connection-dot { background: #d7a248; animation: patient-blink 1.2s ease infinite; }
 
 .patient-shell .workspace {
-  min-height: min(790px, calc(100vh - 158px));
+  flex: 1;
+  min-height: 0;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   grid-template-columns: minmax(0, 1.08fr) minmax(330px, .92fr);
   align-items: stretch;
   gap: clamp(32px, 5vw, 76px);
-  padding: clamp(34px, 5.2vh, 58px) 0 36px;
+  padding: clamp(20px, 3vh, 36px) 0;
 }
 
 .patient-shell .session-panel {
@@ -600,13 +609,10 @@
 .patient-shell .error-banner svg { flex: 0 0 auto; margin-top: 1px; }
 
 .patient-shell .transcript-panel {
-  position: sticky;
-  top: 24px;
   min-width: 0;
-  height: min(720px, calc(100vh - 180px));
-  min-height: 500px;
-  display: flex;
-  flex-direction: column;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 104px minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid #e8ebe6;
   border-radius: 17px;
@@ -650,9 +656,9 @@
 .patient-shell .mini-pulse { width: 7px; height: 7px; border-radius: 50%; background: #55a47a; box-shadow: 0 0 0 4px rgb(85 164 122 / 13%); animation: patient-blink 1.3s ease infinite; }
 
 .patient-shell .turn-list {
-  flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 20px 21px 24px;
   scrollbar-color: #dce4dd transparent;
   scrollbar-width: thin;
@@ -661,12 +667,23 @@
 .patient-shell .turn-list::-webkit-scrollbar { width: 6px; }
 .patient-shell .turn-list::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: #dce4dd; background-clip: padding-box; }
 
+.patient-shell .live-caption-slot {
+  height: 104px;
+  min-height: 104px;
+  max-height: 104px;
+  overflow-y: auto;
+  padding: 12px 21px;
+  scrollbar-color: #dce4dd transparent;
+  scrollbar-width: thin;
+}
+.patient-shell .live-caption-slot .live-caption { margin: 0; }
+
 .patient-shell .empty-state {
-  min-height: 340px;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   color: #738078;
   text-align: center;
 }
@@ -690,15 +707,18 @@
 .patient-shell .empty-state > span { margin-top: 9px; font-size: 10px; line-height: 1.65; }
 
 .patient-shell .turn {
-  padding: 0 0 19px;
-  margin: 0 0 19px;
-  border-bottom: 1px solid #f0f1ed;
+  padding: 0 0 17px;
+  margin: 0 0 17px;
+  border-bottom: 1px solid #f2f3ef;
   animation: patient-arrive .3s ease both;
 }
 
-.patient-shell .turn-content { display: grid; gap: 17px; min-width: 0; }
-.patient-shell .message-row { display: grid; grid-template-columns: 27px minmax(0, 1fr); align-items: flex-start; gap: 10px; }
+.patient-shell .turn-content { display: grid; gap: 15px; min-width: 0; }
+.patient-shell .message-row { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+.patient-shell .user-row { flex-direction: row-reverse; justify-content: flex-start; }
+.patient-shell .agent-row { justify-content: flex-start; }
 .patient-shell .message-avatar {
+  flex: 0 0 27px;
   width: 27px;
   height: 27px;
   display: grid;
@@ -710,13 +730,33 @@
 
 .patient-shell .user-avatar { border: 1px solid #e4e9e2; color: #6c7d72; background: #f2f5f0; }
 .patient-shell .agent-avatar { border: 0; background: transparent; }
-.patient-shell .message-block { min-width: 0; }
+.patient-shell .message-block { width: fit-content; max-width: min(86%, 410px); min-width: 0; }
 .patient-shell .message-meta { display: flex; align-items: center; gap: 8px; min-height: 20px; color: #728078; font-size: 9px; font-weight: 700; }
+.patient-shell .user-row .message-block { text-align: right; }
+.patient-shell .user-row .message-meta { justify-content: flex-end; }
 .patient-shell .message-meta small { color: #a4ada6; font-size: 7px; font-weight: 700; letter-spacing: .85px; }
 .patient-shell .agent-row .message-meta { color: #4a6657; }
 .patient-shell .message-block > p { margin-top: 5px; color: #47564e; font-size: 11px; line-height: 1.65; overflow-wrap: anywhere; }
-.patient-shell .message-block > p.user-message { display: inline-block; max-width: 100%; padding: 9px 12px; border: 1px solid #e9ede8; border-radius: 4px 12px 12px 12px; color: #45544c; background: #f7f8f5; }
-.patient-shell .message-block > p.agent-message { color: #33453b; }
+.patient-shell .message-block > p.user-message {
+  display: inline-block;
+  max-width: 100%;
+  padding: 10px 13px;
+  border: 1px solid #dce9df;
+  border-radius: 15px 4px 15px 15px;
+  color: #334c3d;
+  background: linear-gradient(135deg, #edf5ee, #e6f0e8);
+  text-align: left;
+}
+.patient-shell .message-block > p.agent-message {
+  display: inline-block;
+  max-width: 100%;
+  padding: 10px 13px;
+  border: 1px solid #ecefe9;
+  border-radius: 4px 15px 15px 15px;
+  color: #33453b;
+  background: #fff;
+  text-align: left;
+}
 .patient-shell .welcome-row { padding: 13px 12px 14px; margin: -3px -7px 0; border: 1px solid #e8eee6; border-radius: 12px; background: linear-gradient(120deg, #f7faf5, #fcfcf9); }
 .patient-shell .welcome-row .message-block > p { font-size: 11px; }
 
@@ -815,6 +855,10 @@
 
 .patient-shell .page-footer span:last-child { font-family: Georgia, "Times New Roman", serif; font-size: 11px; font-weight: 400; font-style: italic; letter-spacing: 0; }
 
+@media (min-width: 761px) {
+  .patient-shell .page-footer { display: none; }
+}
+
 @keyframes patient-aura {
   0%, 100% { opacity: .72; transform: translate(-50%, -50%) scale(.94); }
   50% { opacity: 1; transform: translate(-50%, -50%) scale(1.11); }
@@ -838,18 +882,19 @@
   .patient-shell .workspace { grid-template-columns: minmax(0, 1fr) minmax(300px, .88fr); gap: 29px; }
   .patient-shell .mic-stage { width: min(100%, 390px); }
   .patient-shell .orb-scene { height: clamp(180px, 30vw, 225px); }
-  .patient-shell .transcript-panel { height: min(700px, calc(100vh - 168px)); }
 }
 
 @media (max-width: 760px) {
+  .patient-shell.app-shell { height: auto; min-height: 100vh; overflow: visible; }
+  .patient-shell.app-shell { grid-template-rows: auto; }
+  .patient-shell .app-main { height: auto; }
   .patient-shell .app-main { padding: 0 22px; }
   .patient-shell .topbar { min-height: 84px; }
-  .patient-shell .workspace { min-height: 0; grid-template-columns: minmax(0, 1fr); gap: 27px; padding-top: 28px; }
+  .patient-shell .workspace { flex: none; min-height: 0; grid-template-columns: minmax(0, 1fr); gap: 27px; padding-top: 28px; }
   .patient-shell .session-intro { margin-bottom: 19px; }
   .patient-shell .session-intro h2 { font-size: 35px; }
   .patient-shell .mic-stage { width: min(100%, 420px); }
-  .patient-shell .transcript-panel { position: static; height: 500px; min-height: 400px; }
-  .patient-shell .empty-state { min-height: 280px; }
+  .patient-shell .transcript-panel { position: static; height: calc(100vh - 120px); min-height: 440px; }
 }
 
 @media (max-width: 480px) {
@@ -881,6 +926,7 @@
   .patient-shell .transcript-heading .eyebrow { font-size: 7px; }
   .patient-shell .transcript-state { gap: 5px; padding: 6px 7px; font-size: 8px; }
   .patient-shell .turn-list { padding: 16px 14px 20px; }
+  .patient-shell .live-caption-slot { padding-right: 14px; padding-left: 14px; }
   .patient-shell .transcript-panel { height: 440px; min-height: 360px; }
   .patient-shell .page-footer { min-height: 42px; font-size: 7px; letter-spacing: .4px; }
   .patient-shell .page-footer span:last-child { font-size: 10px; }

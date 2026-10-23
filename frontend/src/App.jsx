@@ -730,6 +730,16 @@ function PatientApp() {
               </div>
             </div>
 
+            <div className={`live-caption-slot ${isRecording || liveCaption ? 'is-visible' : ''}`}>
+              {(isRecording || liveCaption) && (
+                <article className="live-caption" role="status" aria-live="polite">
+                  <div className="speaker-label live-caption-label"><span /> YOU <small>LIVE</small></div>
+                  <p>{liveCaption || (liveCaptionSupported ? 'Listening for your words…' : 'Live captions are not supported in this browser.')}</p>
+                  <span className="live-caption-note">{liveCaptionNotice || 'Your final transcript will appear after you finish speaking.'}</span>
+                </article>
+              )}
+            </div>
+
             <div ref={turnListRef} className="turn-list" aria-live="polite" aria-relevant="additions text">
               {turns.length === 0 && !pending && !isRecording && !liveCaption && (
                 <div className="empty-state">
@@ -741,13 +751,6 @@ function PatientApp() {
                   <strong>Your conversation starts here</strong>
                   <span>Ask Janus about appointments, availability,<br />or finding a time that works for you.</span>
                 </div>
-              )}
-              {(isRecording || liveCaption) && (
-                <article className="live-caption" role="status" aria-live="polite">
-                  <div className="speaker-label live-caption-label"><span /> YOU <small>LIVE</small></div>
-                  <p>{liveCaption || (liveCaptionSupported ? 'Listening for your words…' : 'Live captions are not supported in this browser.')}</p>
-                  <span className="live-caption-note">{liveCaptionNotice || 'Your final transcript will appear after you finish speaking.'}</span>
-                </article>
               )}
               {turns.map((turn, index) => (
                 <article className="turn" key={`${index}-${turn.user || turn.agent}`}>

@@ -5,8 +5,8 @@ import {
   CircleHelp,
   Headphones,
   LoaderCircle,
+  Mic,
   Send,
-  Square,
   ShieldCheck,
   Wifi,
   WifiOff,
@@ -404,6 +404,22 @@ function PatientApp() {
     setIsRecording(false)
   }
 
+  const stopAgentPlayback = () => {
+    const turnToCancel = Math.max(
+      playbackTurnRef.current || 0,
+      latestAudioTurnRef.current || 0,
+    )
+    cancelledAudioTurnRef.current = Math.max(
+      cancelledAudioTurnRef.current,
+      turnToCancel,
+    )
+    inputSuppressedRef.current = false
+    stopPlayback()
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ action: 'stop_audio' }))
+    }
+  }
+
   const startLiveCaptions = () => {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!Recognition) return
@@ -485,6 +501,13 @@ function PatientApp() {
     if (isRecording) {
       await stopMicrophone()
       return
+    }
+    if (
+      isPlaying
+      || playbackTurnRef.current !== null
+      || playbackSourcesRef.current.size > 0
+    ) {
+      stopAgentPlayback()
     }
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Microphone access requires a secure browser context such as localhost or HTTPS.')
@@ -569,18 +592,11 @@ function PatientApp() {
   }
 
   const interrupt = () => {
-    const turnToCancel = Math.max(
-      playbackTurnRef.current || 0,
-      latestAudioTurnRef.current || 0,
-    )
-    cancelledAudioTurnRef.current = Math.max(
-      cancelledAudioTurnRef.current,
-      turnToCancel,
-    )
-    stopPlayback()
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ action: 'stop_audio' }))
+    if (recordingRef.current) {
+      stopAgentPlayback()
+      return
     }
+    void startMicrophone()
   }
 
   const sendTextTurn = async (event) => {
@@ -645,24 +661,12 @@ function PatientApp() {
                   className={`mic-button ${isRecording ? 'is-recording' : ''}`}
                   type="button"
                   onClick={isRecording ? () => stopMicrophone() : startMicrophone}
-                  disabled={connectionState === 'connecting' || (pending && !isRecording)}
+                  disabled={!isRecording && (connectionState === 'connecting' || pending || isPlaying)}
                   aria-label={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
                   title={isRecording ? 'Finish speaking' : 'Start speaking with Janus'}
                 >
                   <LiveOrb size="100%" interactive />
                 </button>
-                <div className="orb-particles" aria-hidden="true">
-                  {Array.from({ length: 12 }, (_, index) => (
-                    <i
-                      key={index}
-                      style={{
-                        '--particle': index,
-                        left: `${50 + Math.cos(index * Math.PI / 6) * 47.75}%`,
-                        top: `${50 + Math.sin(index * Math.PI / 6) * 47.75}%`,
-                      }}
-                    />
-                  ))}
-                </div>
               </div>
               <div className="stage-caption">
                 <span className="stage-live-status"><i /> {voiceStatus}</span>
@@ -675,7 +679,7 @@ function PatientApp() {
               </div>
               {isPlaying && (
                 <button className="interrupt-button" type="button" onClick={interrupt}>
-                  <Square size={12} fill="currentColor" /> Stop reply
+                  <Mic size={13} /> Interrupt &amp; talk
                 </button>
               )}
             </div>

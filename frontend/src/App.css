@@ -295,8 +295,7 @@
 }
 
 .patient-shell .orb-halo,
-.patient-shell .orb-aura,
-.patient-shell .orb-particles {
+.patient-shell .orb-aura {
   position: absolute;
   left: 50%;
   top: 50%;
@@ -312,7 +311,7 @@
 }
 
 .patient-shell .orb-halo-outer { width: 222px; height: 222px; border-color: rgb(185 225 201 / 7%); }
-.patient-shell .orb-halo-inner { width: 181px; height: 181px; border-style: dashed; border-color: rgb(203 232 210 / 12%); animation: patient-orbit 56s linear infinite; }
+.patient-shell .orb-halo-inner { width: 181px; height: 181px; border-color: rgb(203 232 210 / 12%); }
 
 .patient-shell .orb-aura {
   width: 165px;
@@ -360,24 +359,6 @@
 
 .patient-shell .mic-button:active:not(:disabled) { transform: scale(.97); }
 .patient-shell .mic-button:disabled { cursor: wait; opacity: .77; }
-
-.patient-shell .orb-particles {
-  width: 245px;
-  height: 245px;
-  transform: translate(-50%, -50%);
-}
-
-.patient-shell .orb-particles i {
-  position: absolute;
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: #d4edda;
-  opacity: .46;
-  translate: -50% -50%;
-  animation: patient-twinkle 2.6s ease-in-out infinite;
-  animation-delay: calc(var(--particle) * -180ms);
-}
 
 .patient-shell .stage-caption {
   position: relative;
@@ -452,10 +433,8 @@
 
 .patient-shell.voice-listening .mic-stage { border-color: #477667; box-shadow: 0 26px 64px rgb(24 45 36 / 18%), 0 0 0 4px rgb(89 147 118 / 9%); }
 .patient-shell.voice-listening .orb-halo-outer { animation: patient-pulse 2.4s ease-out infinite; }
-.patient-shell.voice-listening .orb-halo-inner { animation: patient-orbit 28s linear infinite; }
 .patient-shell.voice-listening .orb-aura { background: radial-gradient(circle, rgb(137 226 172 / 32%) 0%, rgb(100 184 161 / 14%) 43%, transparent 72%); }
 .patient-shell.voice-speaking .orb-aura { background: radial-gradient(circle, rgb(173 210 189 / 32%) 0%, rgb(100 184 161 / 13%) 43%, transparent 72%); }
-.patient-shell.voice-thinking .orb-halo-inner { animation: patient-orbit 16s linear infinite; }
 .patient-shell.voice-thinking .orb-aura { animation-duration: 1.8s; }
 
 .patient-shell .interrupt-button {
@@ -871,7 +850,6 @@
 
 @keyframes patient-orbit { to { transform: translate(-50%, -50%) rotate(360deg); } }
 @keyframes patient-spin { to { transform: rotate(360deg); } }
-@keyframes patient-twinkle { 0%, 100% { opacity: .2; scale: .7; } 50% { opacity: .8; scale: 1.35; } }
 @keyframes patient-equalize { from { height: 3px; transform: scaleY(.7); } to { height: var(--bar-height, 12px); transform: scaleY(1); } }
 @keyframes patient-arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes patient-blink { 50% { opacity: .42; } }
@@ -915,7 +893,6 @@
   .patient-shell .mic-button { width: 112px; height: 112px; }
   .patient-shell .orb-halo-outer { width: 198px; height: 198px; }
   .patient-shell .orb-halo-inner { width: 163px; height: 163px; }
-  .patient-shell .orb-particles { width: 218px; height: 218px; }
   .patient-shell .session-actions { min-height: 49px; }
   .patient-shell .text-entry { padding-top: 16px; }
   .patient-shell .text-entry-note { font-size: 8px; }

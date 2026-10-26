@@ -1,456 +1,268 @@
-# Voice Appointment Agent — Comprehensive Architecture & Technical Reference
+# Voice Agent: Architecture and Project Guide
 
-This document provides a complete technical reference for the real-time, bidirectional Voice Appointment Agent. It details the end-to-end audio and data flow, WebSocket protocols, model configurations, database schema, individual file and function responsibilities, parameters, and server management commands.
+This document describes the application as implemented in the repository. It covers the browser clients, Django/ASGI services, the speech pipeline, appointment and reminder workflows, local configuration, and current operational limitations.
 
----
+## 1. What the application does
 
-## 1. High-Level Architecture & End-to-End Flow
+The project is a local-development voice appointment assistant for a clinic. Patients use a browser chat/voice interface to ask about appointments and request bookings or changes. A separate doctor dashboard lists appointments and reminders, starts reminder calls, and offers a doctor-facing voice assistant.
 
-The system coordinates a real-time conversational voice loop connecting a React frontend to an asynchronous Django ASGI backend over WebSockets.
+The primary technologies are:
 
-```
- [User Browser (Microphone / Text)]
-         │
-         │  Downsampled PCM-16 Audio Chunks (16 kHz, Mono)
-         │  or Control / Text JSON via WebSocket
-         ▼
- ┌───────────────────────────────────────────────────────────────┐
- │ Daphne ASGI Server (Port 8001)                                │
- │ ws://127.0.0.1:8001/ws/voice/                                 │
- ├───────────────────────────────────────────────────────────────┤
- │ VoiceConsumer (channels.generic.websocket.AsyncWebsocketConsumer)
- │                                                               │
- │ 1. VAD Layer (Silero VAD on CPU)                             │
- │    • 512-sample (32ms) sliding evaluation                     │
- │    • 300ms pre-speech buffer                                  │
- │    • 700ms silence endpoint threshold                         │
- │    • User barge-in / interruption cancellation                │
- │                                                               │
- │ 2. STT Layer (Faster-Whisper "base.en" INT8 on CPU)           │
- │    • Direct 16kHz PCM-to-float32 NumPy input                  │
- │    • Transcribes user speech utterance to text                │
- │                                                               │
- │ 3. Dialog & Tool Layer (Groq: openai/gpt-oss-20b)             │
- │    • System instruction persona ("Janus" Receptionist)        │
- │    • Multi-turn history management                            │
- │    • Model configured by GROQ_MODEL                           │
- │    • Explicit bounded tool-calling loop:                       │
- │        - check_doctor_availability()                          │
- │        - book_appointment()                                   │
- │        - list_upcoming_appointments()                         │
- │        - reschedule_appointment()                             │
- │        - cancel_appointment()                                 │
- │                                                               │
- │ 4. Scheduling & Persistence Layer                             │
- │    • Google Calendar API v3 (event creation)                  │
- │    • SQLite Database via Django ORM (Doctor, Appointment,     │
- │      Reminder, ReminderEvent, Transcript)                     │
- │                                                               │
- │ 5. TTS Layer (local Piper "en_US-lessac-medium")              │
- │    • Groq final answer streams sentence by sentence           │
- │    • Piper generates local mono PCM; sent as ordered chunks   │
- └───────────────────────────────┬───────────────────────────────┘
-                                 │
-                                 │ JSON: audio_chunk PCM frames + agent_response caption
-                                 ▼
-                     [React Voice UI Playback]
-              (Web Audio PCM queue + Real-time Captions)
+- **Frontend:** React 18 and Vite.
+- **HTTP and WebSocket backend:** Django, Django Channels, and Daphne/ASGI.
+- **Persistence:** SQLite through Django's ORM.
+- **Speech recognition:** Faster-Whisper running locally on CPU.
+- **Speech activity detection:** Silero VAD running locally through PyTorch.
+- **Speech synthesis:** Piper running locally.
+- **Dialog model:** Groq API, with `GROQ_MODEL` configurable.
+- **Calendar integration:** Google Calendar API, when OAuth credentials are available.
+
+```text
+Browser
+  ├─ Patient UI (/)
+  │    ├─ microphone PCM / typed text ── WebSocket ── VoiceConsumer
+  │    └─ HTTP API calls (dashboard only) ─────────── Django views
+  └─ Doctor UI (/doc)
+       ├─ dashboard and reminders ────────────────── Django views
+       ├─ reminder call ───────────────────────────── DoctorVoiceConsumer
+       └─ Ask Janus ───────────────────────────────── DoctorAssistantConsumer
+
+Django/ASGI
+  ├─ VAD → endpointing → Faster-Whisper → Groq dialog/tools → Piper → browser
+  ├─ ORM/repository → SQLite (appointments, reminders, events, transcripts)
+  └─ Google Calendar service (appointment event synchronization)
 ```
 
-### Detailed Sequence of a Voice Turn
-0. **Connection Welcome**: After voice services initialize, the backend sends Janus’s welcome caption and synthesizes it with Piper. The browser displays the introduction and queues its PCM audio before handling user turns.
-1. **Audio Capture**: The browser requests a 16kHz `AudioContext` so browser-managed resampling is used when supported. At 16kHz it uses 512-sample frames, converts float32 samples directly to 16-bit signed PCM, and streams binary frames over WebSocket. If the requested context rate is unavailable, it falls back to the default context and existing client-side conversion. Browser noise suppression is disabled for the current accuracy comparison; echo cancellation and automatic gain control remain enabled.
-   - In parallel, the frontend uses the browser's `SpeechRecognition` / `webkitSpeechRecognition` API with interim results to show live captions while the user speaks. This does not add STT work to the Django backend or delay its audio pipeline. Browser support, recognition latency, and recognition service/privacy behavior depend on the browser.
-2. **Speech Detection (VAD)**: In `VoiceConsumer`, each chunk is evaluated by `Silero VAD`.
-   - Per-connection buffering retains partial chunks until a complete 512-sample (1024-byte) window is available, avoiding discarded remainders without mixing audio between WebSocket sessions.
-   - If silence precedes speech, a rolling 300ms pre-speech ring buffer retains starting consonants.
-   - Once speech is detected, audio accumulates into `audio_buffer`.
-   - During backend processing, microphone frames are ignored until assistant audio begins. During playback, microphone frames continue to reach VAD as separate 32ms windows; barge-in requires at least six of the latest eight windows to have Silero confidence of 0.75 or higher, filtering brief clicks and cough-like bursts. Confirmed speech cancels the reply and is accumulated as the next utterance, which follows the normal silence-endpoint, STT, dialog, and TTS cycle. The browser signals playback completion so the backend can stop listening for barge-in; echo cancellation and noise suppression reduce false triggers. VAD is a speech-activity detector, not a guaranteed cough-versus-language classifier, so sustained coughs or other speech-like sounds may still pass.
-3. **Endpointing**: When `consecutive_silence_bytes` reaches 700ms (`SILENCE_THRESHOLD_BYTES = 22,400 bytes`), the utterance is marked complete and passed to `process_audio_pipeline()`.
-4. **Transcription (STT)**: The accumulated 16kHz mono PCM bytes are converted directly to a normalized float32 NumPy array and passed to `Faster-Whisper` (`compute_type="int8"`, `beam_size=1`, `vad_filter=False`, `condition_on_previous_text=False`, and English language hint by default). No temporary WAV file is written.
-   - If transcription returns no text, the backend sends a short spoken retry prompt and a final `agent_response` instead of ending silently; no empty user utterance is sent to the dialog model or saved as a transcript.
-5. **Dialog & Tool Execution (LLM)**: The transcribed text is sent to `LLMService.stream_dialog()`. Groq streams the final answer; any requested scheduling tools are executed before its spoken confirmation:
-   - Queries `check_doctor_availability(start_time, end_time)` against SQLite only; when only a start time is supplied the tool checks the default 30-minute window. Appointment writes are synced to Google Calendar when booking.
-   - During a booking availability check, the model also passes any known `caller_name` and `purpose` as optional structured tool arguments. The LLM service retains these with the resolved time in a per-WebSocket booking-context JSON object and reuses it in later tool requests, so only missing fields need to be asked; this uses the existing model call rather than adding a separate extraction request.
-   - If a conflict exists, it informs the caller and asks what other time they prefer. Availability checks inspect the requested database window only; they do not discover alternatives or check Google Calendar, so Janus must not suggest an unverified open time.
-   - Once the user confirms, it executes `book_appointment(caller_name, start_time, end_time, purpose)`.
-   - For an existing patient's schedule, `list_upcoming_appointments(caller_name)` returns up to ten future scheduled rows from SQLite, case-insensitively matched by name.
-   - `reschedule_appointment(caller_name, existing_start_time, new_start_time, new_end_time=None)` requires an unambiguous matching future appointment and rejects conflicts. An omitted `new_end_time` preserves the original duration; a provided end time is used as requested if it is later than the new start. The linked Google Calendar event is patched when authenticated.
-   - `cancel_appointment(caller_name, existing_start_time)` requires an unambiguous future appointment. It deletes the linked Google Calendar event when authenticated, marks the database appointment as cancelled, and refuses to change it when the required calendar event is missing or the calendar deletion fails.
-   - New appointments default to 30 minutes when no end time is provided. Explicitly requested durations are honored.
-6. **Speech Synthesis (TTS)**: As streamed text reaches sentence boundaries, `VoiceConsumer` synthesizes each sentence locally with Piper on a worker thread. A bounded queue lets Groq continue generating while Piper synthesizes the previous sentence.
-7. **Persistence**: The full turn (`User: ... | Agent: ...`) is saved to the `Transcript` table linked to the unique session ID.
-8. **Delivery**: Each synthesized sentence is sent as ordered, Base64-encoded mono PCM chunks; the final `agent_response` carries the complete caption and tool status.
-9. **Playback and captions**: The frontend converts PCM samples into Web Audio buffers and schedules them consecutively as they arrive. Interim browser captions appear while the user speaks; the completed turn uses the backend Faster-Whisper transcript. Barge-in stops all queued audio for the interrupted turn.
+## 2. Repository map
 
-### Doctor Dashboard and Appointment Reminders
-- The React route `/doc` is a separate doctor-facing dashboard with **Upcoming** and **All appointments** tabs. The all-appointments view includes patient, start/end time, purpose, and status; the upcoming tab is limited to future `Scheduled` visits.
-- `GET /api/doc/dashboard/` returns the schedule. `GET /api/doc/reminders/active/` updates doctor-dashboard presence and returns active or snoozed reminders; the dashboard polls it every 10 seconds.
-- **Ask Janus** starts a separate general doctor assistant with a signed token from `POST /api/doc/assistant/call-token/` and `/ws/doc-assistant/`. It shares the existing voice transport, VAD/STT/TTS stack, but uses a doctor-specific prompt and appointment tools to search future appointments by patient, clinic-local date, or start time. Cancellation and rescheduling are proposed against a looked-up appointment, then require explicit confirmation in a later turn before `AppointmentService` applies the change.
-- Chart-review preparation tasks are not currently part of booking or reminders. The legacy `Task` model/table is retained so existing rows are not deleted, but the dashboard and doctor call no longer read or modify those rows.
-- The in-app reminder engine creates a reminder for each appointment booked at least two minutes ahead. It first activates 30 minutes before the appointment and repeats every five minutes, up to six attempts. In the reminder call, **OK/acknowledged** stops further reminders. A plain snooze schedules the next reminder in 15 minutes by default, while an explicit duration is accepted only if it leaves at least one minute before the appointment; the assistant confirms when it will remind again and ends the call. Snoozing changes only the reminder's `next_fire_at`, never the appointment. A move/reschedule request asks for an explicit new date and time, validates availability, applies the change, confirms the new appointment time, and ends the call without asking for another confirmation. Requests still needing details, denied snoozes, and failed reschedules keep the call open. Cancellation and appointment start also update or stop the reminder.
-- The ASGI/WSGI application starts the reminder scheduler in a daemon thread, sweeping every 30 seconds; no separate scheduler command is needed when running the web application. `manage.py run_reminder_scheduler` remains available for a standalone scheduler or `--once` sweep. The old `send_appointment_reminders` command remains a compatibility alias for one in-app sweep and no longer sends email. Run only one web-server process per database unless scheduler leadership is coordinated across processes.
-- Clicking a reminder's **Call** requests a short-lived signed token at `POST /api/doc/reminders/<id>/call-token/` and opens `/ws/doc-voice/`. The token identifies the reminder; the WebSocket consumer validates it and loads that reminder's linked appointment and doctor through `ReminderService.get_call_context()`. The initial appointment-specific greeting is built by the consumer and spoken with local Piper TTS; it is not an LLM-generated greeting. For each user turn, common actions such as acknowledge and snooze are handled directly in code. A move/reschedule request asks for an explicit new date and time before reaching the doctor LLM; it is never treated as the default 15-minute snooze. Other utterances are sent to the doctor LLM with a system prompt containing the bound appointment's patient name, start time, purpose, reminder status, current time, and clinic timezone. The reminder-specific assistant and general **Ask Janus** assistant are separate conversations, but share the same audio transport and speech services.
-- Snoozed reminders are hidden from the active-reminder list until their `next_fire_at` is reached; due snoozes reappear as active, including between scheduler sweeps.
-- The doctor dashboard, reminder APIs, and doctor voice calls are intentionally available only while Django `DEBUG=True`. They are unauthenticated local-development features and must not be exposed to a network or deployed with `DEBUG=True`; real doctor authentication is required first.
+| Location | Responsibility |
+|---|---|
+| `frontend/src/App.jsx` | Patient chat, microphone capture, WebSocket messages, playback, and route selection for `/doc`. |
+| `frontend/src/DoctorDashboard.jsx` | Doctor schedule and reminder dashboard; starts signed-token voice sessions. |
+| `frontend/src/DoctorCallPanel.jsx` | Doctor call UI, microphone/PCM transport, and returned audio playback. |
+| `frontend/src/LiveOrb.jsx` | Shared animated microphone/orb visual. |
+| `frontend/src/*.css` | Patient and doctor dashboard presentation and layout. |
+| `voice_agent_project/settings.py` | Django settings, SQLite, Channels, time zone, reminder options, and logging. |
+| `voice_agent_project/asgi.py` | ASGI HTTP/WebSocket setup and reminder scheduler startup. |
+| `voice_agent_project/wsgi.py` | WSGI setup; also starts the reminder scheduler. |
+| `core/urls.py`, `core/views.py` | HTTP routes and doctor dashboard/reminder token endpoints. |
+| `core/routing.py` | WebSocket route table. |
+| `core/consumers.py` | Patient voice connection, audio/VAD/STT/dialog/TTS pipeline, cancellation, and transcript save. |
+| `core/doc_consumers.py` | Doctor reminder calls and the doctor assistant voice consumer. |
+| `core/models.py` | Doctor, appointment, reminder, reminder-event, legacy task, and transcript models. |
+| `core/repositories.py` | Transactional ORM operations and transcript persistence. |
+| `core/services/` | VAD, STT, TTS, Groq dialog, Calendar, and appointment services. |
+| `core/reminders/` | Reminder lifecycle policy, service, scheduler, and sweep. |
+| `core/tests.py` | Django tests for voice/WebSocket, scheduling, reminders, and integrations. |
+| `manage.py`, `requirements.txt`, `frontend/package.json` | Django entry point and Python/JavaScript dependencies. |
 
-### Local Piper Voice Setup
+## 3. Browser pages and interfaces
 
-Install Python dependencies, then download the default voice model once:
+### Patient experience
+
+`App.jsx` renders the patient application at `/` and other paths, and renders `DoctorDashboard` when the pathname is `/doc`. This is a pathname switch, not a client-side router.
+
+The patient UI supports:
+
+- Voice turns from the microphone control.
+- Typed turns sent over the same WebSocket.
+- Interim live captions from the browser SpeechRecognition API when supported.
+- User/assistant transcript display and queued assistant audio playback.
+- Automatic voice interruption during assistant playback (details in section 4).
+
+The patient WebSocket URL is constructed by the frontend as:
+
+```text
+ws[s]://<current-page-host>:8000/ws/voice/
+```
+
+The page protocol selects `ws` or `wss`; the port is currently hard-coded as `8000`. The frontend's Vite development proxy also forwards `/api` requests to `http://127.0.0.1:8000`. Configure the backend and page origin to match these assumptions, or update the frontend when changing ports.
+
+### Doctor dashboard
+
+At `/doc`, the dashboard requests appointment and active-reminder data from the Django API. The API base is same-origin by default; `VITE_API_BASE_URL` may override it. With Vite's default development server, `/api` is proxied to port 8000.
+
+The dashboard refreshes its appointment data periodically and polls active reminders more frequently. A reminder call and **Ask Janus** each obtain a short-lived signed token over HTTP, then connect to the WebSocket URL returned by Django. `DoctorCallPanel.jsx` manages the call's microphone, audio chunks, and call controls.
+
+### HTTP endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | Basic backend-running response. |
+| `GET` | `/api/doc/dashboard/` | Doctor profile, upcoming appointments, all appointments, and the near-term reminder window. |
+| `GET` | `/api/doc/reminders/active/` | Active or due-snoozed reminders; also records dashboard presence. |
+| `POST` | `/api/doc/reminders/<reminder_id>/call-token/` | Issue a signed token and WebSocket URL for an eligible reminder call. |
+| `POST` | `/api/doc/assistant/call-token/` | Issue a signed token and WebSocket URL for Ask Janus. |
+
+The doctor dashboard, reminder, and call-token endpoints explicitly return 404 when `DEBUG` is false. The project is not configured as a production-ready deployment.
+
+### WebSocket endpoints
+
+| Path | Consumer | Purpose |
+|---|---|---|
+| `/ws/voice/` | `VoiceConsumer` | Patient conversation. The current `authorize()` implementation permits the connection without an application login. |
+| `/ws/doc-voice/` | `DoctorVoiceConsumer` | Signed-token doctor reminder call. |
+| `/ws/doc-assistant/` | `DoctorAssistantConsumer` | Signed-token doctor scheduling assistant. |
+
+The ASGI application wraps WebSockets in Django authentication middleware and `AllowedHostsOriginValidator`; this middleware does not replace the consumer-level authorization check. Doctor tokens are timestamp-signed and validated with a 120-second maximum age.
+
+## 4. Patient voice request/response cycle
+
+### 4.1 Capture and transport
+
+1. The browser requests microphone access with mono capture, echo cancellation, noise suppression, and automatic gain control enabled.
+2. It requests an `AudioContext` at 16 kHz. At that rate, audio is processed in 512-sample frames; if the browser cannot provide the requested rate, the frontend uses a larger processing frame and converts/resamples client-side.
+3. Float audio is converted to signed 16-bit PCM. Binary PCM audio frames are sent over the WebSocket. Text turns and control events are JSON messages on that socket.
+4. Live captions may be generated in parallel by browser SpeechRecognition. These captions are for display; final recognition is performed by the backend STT service.
+
+### 4.2 VAD, speech confirmation, and endpointing
+
+`VoiceConsumer.receive()` buffers incoming bytes until complete 512-sample, 1024-byte VAD windows are available. `VADService.speech_probabilities()` returns a probability for each 32 ms window at 16 kHz. These are contiguous, non-overlapping windows.
+
+The consumer uses the probabilities and per-connection buffers to:
+
+- Keep up to about 300 ms of pre-speech audio to preserve utterance onsets.
+- Confirm ordinary speech after at least three positive VAD windows (probability at least 0.5); brief gaps are tolerated.
+- End an utterance after 700 ms of detected silence.
+- Discard very short utterances below the 250 ms minimum and cap exceptionally long input at 25 seconds.
+- Send a completed utterance to STT after endpointing.
+
+### 4.3 Automatic interruption (barge-in)
+
+The patient microphone stays active while assistant audio is playing. The frontend sends a `playback_complete` control message only after queued audio has finished; this lets the backend distinguish actual playback from the time it takes to generate/send audio.
+
+During playback, barge-in is confirmed only when **at least six of the latest eight VAD windows** have probability at least **0.75**. This is stricter than normal speech-start detection and is intended to suppress brief clicks and cough-like bursts. Once confirmed, the backend cancels the active response task, marks its audio stopped, and retains the user's audio as the start of a new utterance. The new utterance then follows the regular silence endpoint → STT → dialog → TTS path; no interruption button is required.
+
+VAD identifies speech-like activity, not the meaning of audio. Sustained coughs or other speech-like sounds can still meet the threshold. Browser echo cancellation/noise suppression are additional mitigations, not guarantees. No threshold can perfectly distinguish every cough from speech; the tests cover controlled VAD outputs and signal duration, not a comprehensive real-world cough/noise dataset.
+
+During the assistant's thinking/processing phase before audio playback starts, the backend suppresses microphone frames so incidental noise does not cancel model or STT work. The user can interrupt once reply playback is active.
+
+### 4.4 Recognition, dialog, and tools
+
+After endpointing:
+
+1. The backend converts the 16 kHz PCM samples to normalized `float32`.
+2. Faster-Whisper transcribes on CPU, normally with the `base.en` model and `int8` compute. The model and language are configurable through `STT_MODEL` and `STT_LANGUAGE`; the implementation uses beam size 1 and disables Whisper's internal VAD and previous-text conditioning.
+3. Empty transcription produces a spoken retry prompt rather than an empty dialog turn.
+4. `LLMService.stream_dialog()` sends the conversation to Groq, streams text, and processes tool calls through a bounded tool loop. Available patient operations include availability lookup, booking, listing upcoming appointments, rescheduling, and cancellation.
+5. Appointment and calendar rules are handled by the relevant service/repository. In particular, database availability checks do not query Google Calendar FreeBusy.
+
+### 4.5 Sentence streaming, TTS, and persistence
+
+The answer is not waited on in full before synthesis. Groq text is accumulated to sentence boundaries; Piper synthesizes each sentence locally, then the backend sends its mono signed 16-bit PCM as ordered Base64 `audio_chunk` messages (up to 8192 bytes per chunk). The browser queues chunks in order and schedules them with Web Audio. A final `agent_response` message contains the transcript, complete caption, and tool status. Transcript rows are saved per completed turn using a session ID.
+
+### 4.6 Patient WebSocket messages
+
+Implemented client JSON actions include:
+
+- `process_text_turn` — submit a typed user message.
+- `playback_complete` — confirm that the corresponding assistant audio turn finished playback.
+- `stop_audio` — explicit cancellation/control path; it is separate from VAD-triggered interruption.
+- `end_call` — close the connection.
+
+Assistant messages include welcome/processing events, `audio_chunk`, `agent_response`, errors, and `audio_stopped`. Incoming microphone audio itself is sent as binary PCM, not a JSON-wrapped audio object.
+
+## 5. Doctor workflows
+
+### Reminder call
+
+The dashboard polls for reminders eligible for action. A reminder call token is only issued when the reminder remains open, the appointment is scheduled, and its start time is in the future. The signed token authorizes a short-lived `/ws/doc-voice/` connection.
+
+The reminder consumer loads appointment context, records that the call started, and speaks an appointment-specific greeting. It supports acknowledgement and snooze actions, with policy limits and reminder-event records. Call completion and appointment state are handled by the reminder service.
+
+### Ask Janus
+
+The dashboard obtains a signed token for `/ws/doc-assistant/`. This assistant uses doctor-specific context and appointment tools for lookups by patient/date/time, and for proposed cancellations/rescheduling. Destructive schedule changes require a separate affirmative confirmation before they are applied.
+
+The doctor voice consumers share speech services and PCM transport concepts with the patient path, but they are distinct consumers and workflows.
+
+## 6. Scheduling, persistence, and calendar integration
+
+### Data model
+
+- **Doctor:** clinic name/email/time zone and dashboard presence. A database constraint makes the doctor a singleton with ID 1.
+- **Appointment:** patient/caller, start/end time, purpose, status, and optional Google Calendar event ID.
+- **Reminder:** one-to-one with an appointment; status, next-fire time, attempt/snooze/call counts, and acknowledgement metadata.
+- **ReminderEvent:** reminder lifecycle/event record with JSON payload.
+- **Transcript:** a row per saved conversation turn, linked by a session ID; appointment linkage is optional.
+- **Task:** retained legacy model; it is not the primary current reminder mechanism.
+
+`DataRepository` wraps appointment updates and state transitions in database transactions. Appointment writes create, reset, or cancel their related reminders through `ReminderService`.
+
+### Google Calendar
+
+`GoogleCalendarService` looks for a `client_secret*.json` (or `credentials.json`) under the project root and stores OAuth credentials in root-level `token.json` by default. It can refresh credentials and create, update, or delete events. Booking/rescheduling/cancellation may synchronize Calendar events when valid credentials are available; sync failures are logged and the database remains the application's local appointment store.
+
+The patient availability tool currently checks the local database, not Google Calendar FreeBusy. Treat Calendar synchronization and availability checking as separate behaviors.
+
+### Reminder scheduler
+
+Reminder policy defaults are configured in `settings.py` (lead time, retry interval, snooze interval, attempt limit, and minimum reminder lead time). The scheduler runs an in-process sweep and is started when either the ASGI or WSGI application module loads. Running multiple application worker processes can therefore start multiple sweepers; production deployments should move this to a single dedicated worker or an external scheduler before scaling.
+
+## 7. Configuration and local development
+
+`settings.py` loads a root `.env`. Important settings/environment variables include:
+
+| Variable | Purpose |
+|---|---|
+| `DEBUG` | Enables development-only doctor endpoints; defaults to `true`. |
+| `GROQ_API_KEY` | Required for Groq dialog. |
+| `GROQ_MODEL` | Patient dialog model; defaults in `LLMService`. |
+| `DOCTOR_GROQ_MODEL` | Optional doctor assistant model override. |
+| `STT_MODEL`, `STT_LANGUAGE` | Faster-Whisper model/language overrides. |
+| `PIPER_VOICE_PATH` | Optional Piper ONNX voice model path. |
+| `VITE_API_BASE_URL` | Optional dashboard API base URL; empty means same-origin. |
+| `REMINDER_LEAD_MINUTES`, `REMINDER_REPEAT_MINUTES` | Reminder lead and retry intervals. |
+| `SNOOZE_MINUTES`, `SNOOZE_MIN_BUFFER_MINUTES`, `REMINDER_MAX_ATTEMPTS`, `REMINDER_MIN_LEAD_TO_REMIND_MINUTES` | Reminder snooze and attempt policy. |
+| `DOCTOR_PRESENCE_TTL_SECONDS`, `VOICE_INCLUDE_PURPOSE`, `CALL_AUTO_HANGUP_AFTER_TERMINAL` | Doctor presence and voice-call behavior. |
+
+The default Piper model path is `models/piper/en_US-lessac-medium.onnx`; the corresponding voice can be downloaded with:
+
 ```powershell
 python -m piper.download_voices --download-dir models/piper en_US-lessac-medium
 ```
-The application expects `models/piper/en_US-lessac-medium.onnx` by default. Set `PIPER_VOICE_PATH` to an alternate ONNX voice file if needed. Piper synthesis runs locally after the voice model is installed; it does not send response text to a hosted TTS service.
 
----
+Typical local startup from the repository root:
 
-## 2. WebSocket Protocol & Parameter Specification
-
-- **Connection URL**: `ws://127.0.0.1:8001/ws/voice/`
-- **Protocol Handshake**: Standard WebSocket RFC 6455 over ASGI (`daphne`).
-
-### A. Inbound Messages (Client to Server)
-
-#### 1. Binary PCM Audio Stream
-Sent continuously while microphone recording is active.
-- **Data Type**: `bytes` (Binary WebSocket frame)
-- **Sample Rate**: `16,000 Hz`
-- **Bit Depth**: `16-bit Signed Integer (Little-Endian)`
-- **Channels**: `1 (Mono)`
-- **Chunk Size**: Dynamically emitted by the browser audio processor (~4096 input frames resampled to ~1,365 samples = ~2,730 bytes).
-- **Alignment Requirement**: The server enforces 2-byte alignment (`aligned_len = len(bytes_data) - (len(bytes_data) % 2)`).
-
-#### 2. Process Text Turn
-Used when the user types in the input box instead of using speech.
-```json
-{
-  "action": "process_text_turn",
-  "text": "Is Dr. Smith available tomorrow at 2 PM?"
-}
-```
-- `action` (string, required): Must be `"process_text_turn"`.
-- `text` (string, required): The user's typed message.
-
-#### 3. Stop Audio / Interruption Signal
-Sent when the user clicks the Stop/Mute button or begins speaking during playback.
-```json
-{
-  "action": "stop_audio"
-}
-```
-- `action` (string, required): Must be `"stop_audio"`.
-
----
-
-### B. Outbound Messages (Server to Client)
-
-#### 1. Audio Chunk
-Emitted as local Piper synthesis produces audio for each completed sentence.
-```json
-{
-  "type": "audio_chunk",
-  "turn_id": 1,
-  "sequence": 0,
-  "format": "pcm_s16le",
-  "channels": 1,
-  "sample_rate": 22050,
-  "audio_payload": "base64-encoded PCM bytes"
-}
-```
-- `turn_id` (integer): Turn identifier used to discard audio after interruption.
-- `sequence` (integer): Zero-based order of PCM frames within the turn.
-- `format` (string): Signed 16-bit little-endian PCM.
-- `audio_payload` (string): Base64-encoded audio frame; frame size is at most 8192 bytes.
-
-#### 2. Agent Response
-Sent after the final audio chunk for the turn.
-```json
-{
-  "type": "agent_response",
-  "turn_id": 1,
-  "user_transcription": "Is Dr. Smith available tomorrow at 2 PM?",
-  "caption": "Dr. Melvin is available tomorrow at 2 PM.",
-  "tool_status": "availability_checked"
-}
-```
-- `caption` (string): The complete verbal response streamed from the configured Groq model.
-- `tool_status` (string | null): Scheduling tool status as described below.
-
-Scheduling tool status values:
-  - `"availability_checked"`: Availability query executed, slot is open.
-  - `"conflict_detected"`: Slot is occupied on Google Calendar or DB.
-  - `"calendar_booked"`: Appointment confirmed and written to DB + Google Calendar.
-  - `null`: Pure conversational turn (no tool invoked).
-  - `"error"`: Tool execution failed.
-
-#### 3. Audio Interruption / Cutoff Signal
-Emitted when an active turn is cancelled due to user barge-in.
-```json
-{
-  "status": "audio_stopped",
-  "turn_id": 1
-}
-```
-
-#### 4. Error Notification
-Emitted if an unrecoverable failure occurs during processing.
-```json
-{
-  "type": "error",
-  "message": "A voice turn is already being processed."
-}
-```
-
----
-
-## 3. Database Schema & Data Models ([models.py](file:///C:/Users/Musa%20Shah/Desktop/Voice%20Agent/core/models.py))
-
-Located in [core/models.py](file:///C:/Users/Musa%20Shah/Desktop/Voice%20Agent/core/models.py). The database engine is SQLite (`db.sqlite3`).
-
-### 1. `Doctor` Model
-Enforces a singleton doctor record representing Dr. Smith.
-```python
-class Doctor(models.Model):
-    SINGLETON_ID = 1
-    name = models.CharField(max_length=255)
-    email = models.EmailField(unique=True)
-    timezone = models.CharField(max_length=50, default='Asia/Karachi')
-```
-- **Constraints**: Database-level check constraint `doctor_singleton_id` guarantees `id == 1`.
-- **Default Record**: ID 1, `name="Dr. Melvin"`, `email="musa813705@gmail.com"`, `timezone="Asia/Karachi"`.
-
-### 2. `Appointment` Model
-Stores scheduled clinic appointments.
-```python
-class Appointment(models.Model):
-    doctor = models.ForeignKey(Doctor, on_delete=models.CASCADE)
-    caller_name = models.CharField(max_length=255)
-    start_time = models.DateTimeField()
-    end_time = models.DateTimeField()
-    purpose = models.TextField()
-    status = models.CharField(max_length=50, default='Scheduled')
-    google_event_id = models.CharField(max_length=255, null=True, blank=True)
-```
-- `doctor`: ForeignKey to `Doctor` (ID 1).
-- `caller_name`: Patient or caller full name.
-- `start_time` / `end_time`: Timezone-aware timestamps representing the clinic-local appointment window; Django stores instants in UTC.
-- `purpose`: Reason for visit or symptoms described by patient.
-- `status`: Default `"Scheduled"`. Can be `"Cancelled"`, `"Completed"`.
-- `google_event_id`: Optional ID of the clinic calendar event created for this appointment; used to patch its time when rescheduling.
-
-### 3. `Transcript` Model
-Audit trail of dialogue turns for all sessions.
-```python
-class Transcript(models.Model):
-    appointment = models.ForeignKey(Appointment, on_delete=models.SET_NULL, null=True, blank=True)
-    session_id = models.CharField(max_length=100)
-    full_transcript = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
-```
-- `session_id`: Unique identifier derived from the WebSocket channel name (`session_specific..inmemory!...`).
-- `full_transcript`: Formatted turn string (`"User: ... | Agent: ..."`).
-
----
-
-## 4. File-by-File Breakdown & Function Responsibilities
-
-### `core/consumers.py`
-**Responsibility**: WebSocket connection lifecycle, VAD buffering, speech endpointing, audio pipeline dispatch, barge-in interruption handling, and response delivery.
-
-| Constant / Parameter | Value | Description |
-| :--- | :--- | :--- |
-| `AUDIO_SAMPLE_RATE` | `16000` | Input audio sample frequency in Hz. |
-| `AUDIO_SAMPLE_WIDTH` | `2` | 16-bit audio = 2 bytes per sample. |
-| `BYTES_PER_MS` | `32` | 1 millisecond = (16000 * 2) / 1000 = 32 bytes. |
-| `SILENCE_THRESHOLD_MS` | `700` | Sustained silence duration required to trigger end of utterance. |
-| `SILENCE_THRESHOLD_BYTES`| `22400` | 700 ms * 32 bytes/ms. |
-| `PRE_SPEECH_BUFFER_BYTES`| `9600` | 300 ms lead-in ring buffer to prevent clipping starting consonants. |
-| `MIN_SPEECH_BYTES` | `8000` | 250 ms minimum audio required to reject mic pops/coughs. |
-| `MAX_SPEECH_BYTES` | `800000` | 25 seconds safety ceiling to force processing in noisy environments. |
-
-#### Methods in `VoiceConsumer`:
-- `connect(self)`: Accepts the WebSocket handshake, assigns `self.session_id`, initializes singletons (`vad`, `stt`, `tts`, `llm`), and allocates memory buffers.
-- `disconnect(self, close_code)`: Cancels any active async turn task and logs disconnection.
-- `receive(self, text_data=None, bytes_data=None)`:
-  - If `bytes_data`: Aligns byte boundaries, calls `vad.is_speech(clean_chunk)`. Handles user interruption (cancelling active task and sending `audio_stopped`). Manages transitions between pre-speech buffer, active speech accumulation, and silence endpoint detection.
-  - If `text_data`: Parses JSON actions (`"process_text_turn"` or `"stop_audio"`).
-- `_reset_speech_state(self)`: Clears `audio_buffer`, `pre_speech_buffer`, resets `speech_detected = False` and `consecutive_silence_bytes = 0`.
-- `_start_task(self, coroutine)`: Dispatches `coroutine` as an `asyncio.Task` with collision guard (`_send_busy()` if a task is already executing).
-- `_run_safely(self, coroutine)`: Wraps coroutine execution to catch `asyncio.CancelledError` and log unhandled exceptions.
-- `process_audio_pipeline(self, audio_data: bytes)`: Converts PCM-16 input directly to normalized float32 NumPy samples, calls `stt.transcribe()`, and triggers `run_dialog_and_respond()`.
-- `run_dialog_and_respond(self, user_text: str)`: Executes `llm.process_dialog()`, calls `tts.synthesize()`, encodes audio as base64, persists turn to `Transcript` in the DB, and dispatches `agent_response` over WebSocket.
-
----
-
-### `core/services/vad_service.py`
-**Responsibility**: Voice Activity Detection on CPU using Silero VAD to detect speech presence in streaming audio chunks.
-
-- `VADService.__init__(self)`: Loads Silero VAD PyTorch model on CPU from PyTorch Hub cache.
-- `is_speech(self, audio_chunk: bytes, sampling_rate: int = 16000, threshold: float = 0.5) -> bool`:
-  - **Input**: Raw PCM-16 `bytes` chunk.
-  - **Processing**: Converts bytes to `np.int16`, normalizes to `float32` in range `[-1.0, 1.0]`, converts to `torch.Tensor`.
-  - **Window Evaluation**: Slices tensor into 512-sample (32ms) windows. If any window exceeds `threshold` probability (default 0.5), returns `True`.
-- `get_vad_service() -> VADService`: Module-level singleton provider.
-
----
-
-### `core/services/stt_service.py`
-**Responsibility**: English Speech-to-Text transcription on CPU using `faster-whisper`.
-
-- `STTService.__init__(self, model_size="base.en", language="en")`: Loads Faster-Whisper on CPU using `compute_type="int8"`. The consumer accepts `STT_MODEL` and `STT_LANGUAGE` environment overrides.
-- `transcribe(self, audio_input) -> str`:
-  - **Input**: Float32 NumPy audio array (used by the live consumer), WAV file path, raw PCM-16 bytes, or numpy float32 array.
-  - **Processing**: Calls `model.transcribe(beam_size=1, vad_filter=False, condition_on_previous_text=False, language="en")` by default. Local VAD has already detected speech, so Whisper's VAD filter is disabled.
-  - **Output**: Joined text transcription string.
-- `get_stt_service(model_size="base.en", language="en") -> STTService`: Module-level singleton cache keyed by model and language.
-
-The current default is the English-only `base.en` model. It was compared locally with multilingual `base` on one supplied sample: mean transcription times were approximately 0.89 s vs. 0.91 s, and normalized transcripts were 98.7% similar. This single-sample measurement is not a general accuracy or latency guarantee. STT stays local by default; no audio is sent to Groq.
-
----
-
-### `core/services/llm_service.py`
-**Responsibility**: Conversational state management, Groq API interactions, and tool calling for scheduling actions.
-
-- **Model**: Reads `GROQ_MODEL` from `.env`, defaulting to `openai/gpt-oss-20b`.
-- `__init__(self, calendar_service=None)`: Initializes the Groq client with `GROQ_API_KEY`.
-- `_get_system_instruction(self) -> str`: Dynamically embeds current date and time (`Monday, October 12, 2026 at...`) and instructs Janus on tool calling, concise voice responses, and medical receptionist persona.
-- `_parse_datetime(self, dt_str: str) -> datetime.datetime`: Parses ISO and common datetime strings; naive values are clinic-local (`Asia/Karachi`), while offset-aware values are converted to the clinic timezone.
-- `check_doctor_availability(self, start_time: str, end_time: Optional[str] = None) -> Dict[str, Any]`:
-  - Queries SQLite only for conflicting `Appointment` records where `start_time < slot_end AND end_time > slot_start`; does not call Google Calendar.
-  - Defaults the checked window to 30 minutes from the requested start time.
-  - Formats conflicts and available times in the clinic timezone.
-  - Returns `{"available": bool, "conflicts": list, "message": str}`.
-  - Updates `self.last_tool_status` to `"availability_checked"` or `"conflict_detected"`.
-- `book_appointment(self, caller_name: str, start_time: str, purpose: str, end_time: Optional[str] = None) -> Dict[str, Any]`:
-  - Inserts event to Google Calendar if authenticated, using an explicit clinic-local UTC offset.
-  - Calls `DataRepository.create_appointment_sync()` to persist appointment and its Google event ID to SQLite.
-  - Defaults to a 30-minute appointment unless an end time is explicitly requested.
-  - Updates `self.last_tool_status` to `"calendar_booked"`.
-- `list_upcoming_appointments(self, caller_name: str) -> Dict[str, Any]`:
-  - Returns up to ten future `"Scheduled"` appointments with a case-insensitive exact patient-name match, ordered by start time.
-  - Returns date/time values in clinic-local time and asks the model to clarify when multiple appointments match.
-- `reschedule_appointment(self, caller_name: str, existing_start_time: str, new_start_time: str, new_end_time: Optional[str] = None) -> Dict[str, Any]`:
-  - Matches a future appointment by patient name and existing start minute; rejects missing or ambiguous matches and conflicting new slots.
-  - Preserves appointment duration unless a new end time is specified and patches the corresponding Google Calendar event if authenticated.
-  - Updates the database only after the calendar succeeds; attempts to restore the old calendar time if the database update fails.
-- `cancel_appointment(self, caller_name: str, existing_start_time: str) -> Dict[str, Any]`:
-  - Matches one future `"Scheduled"` appointment by case-insensitive exact caller name and existing start minute; refuses missing or ambiguous matches.
-  - Deletes the saved Google Calendar event before marking the appointment `"Cancelled"` in SQLite. If Calendar is authenticated but the appointment has no stored event ID, or Calendar deletion fails, it leaves the database unchanged and reports an error.
-- `_build_messages(self, conversation_history: list, user_input: str)`: Builds provider messages from prior turns and the current input.
-- `process_dialog(self, conversation_history: list, user_input: str) -> Tuple[str, Optional[str]]`: Calls the configured Groq model and runs at most five tool-call rounds, returning tool results to the model before the final response.
-  - Appends turns to `conversation_history`.
-  - Returns `(response_text, tool_status)`.
-
----
-
-### `core/services/tts_service.py`
-**Responsibility**: Local sentence-by-sentence speech synthesis to mono PCM using Piper.
-
-- `TTSService.__init__(self)`: Loads the `en_US-lessac-medium` ONNX voice from `PIPER_VOICE_PATH` or `models/piper/en_US-lessac-medium.onnx`.
-- `synthesize(self, text: str) -> Tuple[bytes, int]`: Generates local signed 16-bit mono PCM and returns `(audio_bytes, sample_rate)`.
-- `get_tts_service() -> TTSService`: Module-level singleton provider.
-
----
-
-### `core/services/calendar_service.py`
-**Responsibility**: Google Calendar API v3 integration, OAuth credential handling, and event queries.
-
-- `__init__(self, credentials_file=None, token_file=None, base_dir=None)`: Discovers `client_secret_*.json` in root directory and defaults token storage to `token.json`.
-- `is_authenticated(self) -> bool`: Checks if valid, unexpired credentials exist in `token.json`. Gracefully degrades to local DB scheduling if false.
-- `authenticate_interactive(self, port=0) -> bool`: Launches interactive OAuth consent flow in browser and saves `token.json`. Can be run directly via CLI.
-- `check_availability(self, start_time, end_time, calendar_id='primary') -> Dict[str, Any]`: Optional direct FreeBusy helper; the appointment availability tool does not call it and checks SQLite only.
-- `create_event(self, summary, start_time, end_time, description="", calendar_id='primary', caller_name=None) -> Dict[str, Any]`: Inserts confirmed event via `service.events().insert()`.
-
----
-
-### `core/repositories.py`
-**Responsibility**: Synchronous database persistence helpers executed within `database_sync_to_async` thread pools.
-
-- `save_transcript(session_id: str, full_transcript: str) -> Transcript`: Persists conversational turns to `Transcript`.
-- `create_appointment_sync(caller_name: str, start_time, end_time, purpose: str) -> int`: Persists confirmed appointment linked to `Doctor` singleton ID 1 and returns the new appointment ID.
----
-
-### `frontend/src/App.jsx`
-**Responsibility**: Web Audio recording, real-time PCM downsampling, WebSocket transport, audio decoding/playback, captions, and interruption controls.
-
-- `pcm16FromFloat(input: Float32Array, inputSampleRate: number) -> ArrayBuffer`: Resamples browser microphone audio (typically 44.1kHz or 48kHz) down to 16,000 Hz 16-bit signed Linear PCM integers.
-- `connectSocket()`: Connects to `ws://localhost:8001/ws/voice/` with a 6-second timeout.
-- `startMicrophone()`: Requests `getUserMedia` (mono, echoCancellation, noiseSuppression), creates `ScriptProcessor(4096, 1, 1)`, and streams binary PCM chunks over WebSocket.
-- `startLiveCaptions()`: Starts browser speech recognition with interim results and updates the temporary live-caption display. If unavailable, the UI indicates that the final backend transcript will appear after processing.
-- `stopMicrophone(notifyBackend = true)`: Disconnects audio nodes, stops mic tracks, closes `AudioContext`, and notifies backend with `{"action": "stop_audio"}`.
-- `playReply(audioPayload: string)`: Decodes base64 string to a binary `Uint8Array`, creates a `Blob` of type `audio/mpeg`, and plays it via HTML5 `Audio`.
-- `interrupt()`: Instantly cuts off local audio playback and sends `stop_audio` over WebSocket.
-- `sendTextTurn(event)`: Submits typed text turns via `{"action": "process_text_turn", "text": "..."}`.
-
----
-
-## 5. Server Startup & Verification Commands
-
-All commands are executed from the project root (`C:\Users\Musa Shah\Desktop\Voice Agent`).
-
-### 1. Python Environment Setup
 ```powershell
-# Activate the existing virtual environment
-.\venv\Scripts\Activate.ps1
-
-# Verify all dependencies are installed
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python manage.py migrate
+daphne -b 127.0.0.1 -p 8000 voice_agent_project.asgi:application
 ```
 
-### 2. Database Migrations & Seeding
-```powershell
-# Run pending migrations
-.\venv\Scripts\python.exe manage.py migrate
+In another terminal:
 
-# Verify the Doctor singleton record (ID 1: Dr. Melvin) is seeded
-.\venv\Scripts\python.exe -c "import django, os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'voice_agent_project.settings'); django.setup(); from core.models import Doctor; doc, _ = Doctor.objects.get_or_create(id=Doctor.SINGLETON_ID, defaults={'name': 'Dr. Melvin', 'email': 'musa813705@gmail.com', 'timezone': 'Asia/Karachi'}); print(f'Doctor seeded: {doc.name} (ID: {doc.id})')"
-```
-
-Run a one-time reminder sweep to test the in-app reminder engine:
-```powershell
-.\venv\Scripts\python.exe manage.py run_reminder_scheduler --once
-```
-
-Run the patient-facing UI at `http://localhost:3000/`; the local doctor dashboard is at `http://localhost:3000/doc/`. The dashboard reads `http://localhost:8000/api/doc/dashboard/`. Set `VITE_API_BASE_URL` in the frontend environment if the Django API runs at a different host or port.
-
-### 3. Optional: Google Calendar Interactive OAuth
-```powershell
-# Run browser OAuth flow to generate token.json (optional; falls back to DB if omitted)
-.\venv\Scripts\python.exe -m core.services.calendar_service
-```
-
-### 4. Start the Daphne ASGI Backend Server
-```powershell
-# Launch Daphne on port 8001
-.\venv\Scripts\daphne.exe -b 127.0.0.1 -p 8001 voice_agent_project.asgi:application
-```
-
-Pipeline INFO logs are written to the same terminal. Follow the `Pipeline` messages by session ID to trace connection and service initialization, VAD/endpointing, STT, dialog and tool execution, TTS, transcript persistence, response delivery, and disconnects. Audio and transcript contents are not included in these pipeline logs.
-
-### 5. Start the Vite Frontend Development Server
-In a separate terminal window:
 ```powershell
 cd frontend
 npm install
-npm run dev -- --port 3000
+npm run dev
 ```
-Open **`http://localhost:3000`** in Google Chrome or Microsoft Edge.
 
-### 6. Run the Automated Test Suite
+Open the Vite URL (normally `http://localhost:5173/`); use `/doc` for the doctor dashboard. Keep the backend on port 8000 unless the hard-coded patient WebSocket URL and Vite `/api` proxy are changed. Set local credentials in `.env`; do not commit API keys, OAuth client secrets, or token files.
+
+Useful checks:
+
 ```powershell
-# Execute all 11 unit tests across VAD, STT, TTS, Calendar, LLM, and Consumers
-.\venv\Scripts\python.exe manage.py test core
+python manage.py check
+python manage.py test core.tests
+cd frontend
+npm run build
 ```
 
----
+The backend's `CHANNEL_LAYERS` uses an in-memory channel layer and its database is SQLite. These are convenient for local development, but are not shared across processes and are not a production scaling configuration.
 
-## 6. Verification Checklist
+## 8. Operational constraints and known boundaries
 
-- [x] **Microphone Capture**: Captures 1-channel audio, converts float32 to 16kHz PCM-16.
-- [x] **WebSocket Transport**: Binary PCM audio streams cleanly to `ws://127.0.0.1:8001/ws/voice/`.
-- [x] **VAD Endpointing**: 512-sample evaluation on CPU with 700ms silence detection.
-- [x] **Faster-Whisper STT**: Transcribes local English voice input directly from float32 PCM arrays with `base.en` and CPU INT8 inference.
-- [x] **LLM Tool Calling**: Groq's configured model executes free/busy checks and appointment bookings.
-- [x] **Database Persistence**: Appointments, tasks, and dialogue transcripts persist to SQLite.
-- [x] **Streaming Speech Playback**: Groq sentence output is synthesized by local Piper, relayed as PCM chunks, and queued with Web Audio.
-- [x] **Interruption / Barge-in**: User speaking mid-reply cuts off playback immediately.
+- **Development posture:** `DEBUG` defaults to true, `ALLOWED_HOSTS` is wildcarded, and the settings file contains a development secret. Configure deployment security before exposing the service.
+- **Patient authorization:** the patient consumer currently accepts connections without application-level authentication. ASGI middleware does not change that consumer policy.
+- **Doctor API access:** doctor dashboard/reminder APIs are disabled outside debug mode; review and implement production authentication/authorization before enabling them.
+- **Scaling:** SQLite, the in-memory channel layer, singleton service caches, and an in-process reminder scheduler are local/single-process assumptions.
+- **Calendar:** valid OAuth is needed for Google synchronization; local database status remains the source of local appointment data. Availability does not query Calendar FreeBusy.
+- **Speech interruption:** probability thresholds reduce accidental interruptions but are not semantic speech recognition and cannot guarantee rejection of every cough/noise.
+- **Browser behavior:** microphone capture and SpeechRecognition support depend on browser permissions and implementation. Capture options are requests to the browser/device, not universal guarantees.
+
+## 9. Source-of-truth files
+
+When behavior changes, update this guide alongside the implementation. The main runtime paths are `frontend/src/App.jsx`, `frontend/src/DoctorDashboard.jsx`, `frontend/src/DoctorCallPanel.jsx`, `core/consumers.py`, `core/doc_consumers.py`, `core/services/`, `core/reminders/`, `core/models.py`, and `core/repositories.py`.
